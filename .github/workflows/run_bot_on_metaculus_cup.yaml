@@ -30,17 +30,39 @@ jobs:
           installer-parallel: true
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
+      - name: Restore OpenRouter spend ledger
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/openrouter_spend.json
+          key: openrouter-spend-${{ github.run_id }}
+          restore-keys: |
+            openrouter-spend-
       - name: Run bot
         run: |
           poetry run python main.py --mode metaculus_cup
-        # this reads the environment variables from the github repository.
-        # Store under Settings --> Secrets and variables --> Actions
+        # Secrets stay in the environment. Do not print them.
         env:
-          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+      - name: Keep a spend ledger if the bot did not write one
+        if: always()
+        run: |
+          mkdir -p logs
+          if [ ! -f logs/openrouter_spend.json ]; then
+            printf '%s\n' '{"remote_usd": 0.0, "gap_usd": 0.0}' > logs/openrouter_spend.json
+          fi
+      - name: Show spend ledger
+        if: always()
+        run: |
+          python -c 'import json; d=json.load(open("logs/openrouter_spend.json")); print({k: d[k] for k in ("remote_usd", "gap_usd") if k in d})'
+      - name: Save OpenRouter spend ledger
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: logs/openrouter_spend.json
+          key: openrouter-spend-${{ github.run_id }}

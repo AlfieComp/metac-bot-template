@@ -1,6 +1,22 @@
 # Simple Metaculus forecasting bot
 This repository contains a simple bot meant to get you started with creating your own bot for the AI Forecasting Tournament. Go to https://www.metaculus.com/futureeval/participate/ for more info and tournament rules (and then go to the  "Getting Started" section of our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page).
 
+## This fork
+The tournament bot is `main.py`. Each question gets one AskNews briefing (skipped if no AskNews key is set), one Gemini 3.6 Flash pass over the resolution criteria and fine print, then five reasoned forecasts. The submitted forecast is the median of those five.
+
+| Seat | OpenRouter model |
+|---|---|
+| 3 forecasts | `google/gemini-3.6-flash` |
+| 1 forecast | `moonshotai/kimi-k3` |
+| 1 forecast | `deepseek/deepseek-v4-pro` |
+| Output parser | `deepseek/deepseek-v4-flash` |
+
+Reasoning is requested on every forecaster (`reasoning.effort=high`). Probabilities are clipped to 1–99%. Crowd and market odds are removed from the AskNews text. There is no debate step.
+
+Recorded OpenRouter spend switches the five forecasters to DeepSeek V4 Pro once it reaches US$3.50, and the bot stops calling models at US$4.50. Cap the OpenRouter key at US$4.50 in the dashboard as well. A mixed question is about US$0.12; a DeepSeek-only question is about US$0.02. See the pull request for the token assumptions behind those figures.
+
+`poetry install` does not install the optional `integrations` group. The weekly review workflow is the only place that group is installed, and that workflow stays off unless `REVIEW_BOT_ENABLED` is set.
+
 **Brand new to this?** You can get a working bot running in about 5 minutes without writing a single line of code — just fork this repo, paste two API keys into GitHub, and click "Run workflow". See **[Quick start](#quick-start--fork-and-use-github-actions)** below.
 
 In this project are 2 files:
@@ -28,7 +44,7 @@ The easiest way to use this repo is to fork it, paste in two API keys, and click
    - **`METACULUS_TOKEN`** — create one at https://www.metaculus.com/futureeval/participate/ (see the [resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#creating-your-bot-account-and-metaculus-token) if you get stuck).
    - **`OPENROUTER_API_KEY`** — get free credits via [this form](https://forms.gle/aQdYMq9Pisrf1v7d8), or make your own key on [OpenRouter](https://openrouter.ai/). You can also use `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `PERPLEXITY_API_KEY`, `ASKNEWS_SECRET`, etc. — these all work out of the box if you set them.
 3) **Enable Actions**: click the `Actions` tab, then click `I understand my workflows, go ahead and enable them`.
-4) **Run the test workflow to confirm everything works**: go to `Actions → Test Bot → Run workflow → Run workflow` (green button). This forecasts on whatever's currently open in the [bot-testing-area tournament](https://www.metaculus.com/tournament/bot-testing-area/) so you can verify your setup posts forecasts to Metaculus end-to-end. Once the run finishes (~3–5 min), [switch to your bot account](#seeing-your-bots-forecasts) on Metaculus to check that the forecasts landed. They won't show up on your human account.
+4) **Run the test workflow to confirm everything works**: go to `Actions → Test Bot → Run workflow → Run workflow` (green button). That runs the unit tests only. It does not spend OpenRouter credit and it does not post a forecast. To smoke-test one live question without posting it, run the same workflow with **live dry run** checked. That spends about one question of credit and does not submit.
 5) **You're done! (and participation form)**: The `Forecast on new AI tournament questions` workflow is already enabled and will run every 20 minutes, picking up any new tournament questions and skipping ones it has already forecast on. Before you start submitting forecasts, all participants are required to fill out the first section of our [participation](https://forms.gle/aQdYMq9Pisrf1v7d8) form. There are only 3 required questions, so it should be pretty quick. This form is used to help us learn about the demographics and motivations of our community in FutureEval, amplify individual projects/research, and also to collect applications for LLM credits.
 
 To pause your bot, go to `Actions → Forecast on new AI tournament questions → ... (top right) → Disable workflow`.
@@ -56,7 +72,7 @@ Instructions for getting your METACULUS_TOKEN, OPENROUTER_API_KEY, or optional s
 
 ## Changing the Github automation
 To run a different script under the same workflows, edit the `poetry run python main.py` line in the appropriate file under `.github/workflows/` and replace `main.py` with your script. The workflows that exist:
-- `test_bot.yaml` — manual-trigger smoke test against the bot-testing-area tournament.
+- `test_bot.yaml` — unit tests on every pull request. An optional manual dry run forecasts one bot-testing-area question and does not submit it.
 - `run_bot_on_tournament.yaml` — every 20 min on the live AIB tournament + MiniBench.
 - `run_bot_on_metaculus_cup.yaml` — every 2 days on the Metaculus Cup.
 
@@ -128,8 +144,8 @@ poetry run python main_with_no_framework.py
 This file has no `--mode` flag; it's controlled by the constants at the top of the file (`SUBMIT_PREDICTION`, `USE_EXAMPLE_QUESTIONS`, `TOURNAMENT_ID`, etc.). Flip `USE_EXAMPLE_QUESTIONS = True` to point it at the bot-testing-area tournament instead of the live AIB.
 
 To stop publishing forecasts (dry-run mode):
-- `main.py`: set `publish_reports_to_metaculus=False` in the `FallTemplateBot2026(...)` constructor near the bottom.
-- `main_with_no_framework.py`: set `SUBMIT_PREDICTION = False` at the top.
+- `main.py`: pass `--dry-run`. Add `--max-questions 1` to limit spend. This still calls the models.
+- `main_with_no_framework.py` is the upstream single-file reference and is not the tournament bot. It still publishes when `SUBMIT_PREDICTION = True`.
 
 ## Reviewing how your bot did
 
