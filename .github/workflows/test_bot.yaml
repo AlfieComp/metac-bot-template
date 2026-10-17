@@ -5,32 +5,30 @@ on:
   workflow_dispatch:
     inputs:
       live_dry_run:
-        description: "Forecast one bot-testing-area question without submitting (spends OpenRouter credit)"
+        description: "Forecast bot-testing-area questions without submitting (spends OpenRouter credit)"
         type: boolean
         default: false
+      max_questions:
+        description: "How many bot-testing-area questions to forecast without submitting"
+        type: number
+        default: 1
 
 permissions:
   contents: read
 
-# Add concurrency group to prevent parallel runs
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
-
-
 # Unit tests do not call Metaculus, OpenRouter, or AskNews.
-# The optional live dry run forecasts one question and does not publish it.
+# The optional live dry run forecasts bot-testing-area questions and does not publish them.
 jobs:
   unit_tests:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
       - name: Install poetry
-        uses: snok/install-poetry@v1
+        uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1
         with:
           virtualenvs-create: true
           virtualenvs-in-project: true
@@ -44,14 +42,18 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.live_dry_run
     needs: unit_tests
     runs-on: ubuntu-latest
+    # Same cache group as the tournament and Cup jobs.
+    concurrency:
+      group: metac-bot-forecast
+      cancel-in-progress: false
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
       - name: Install poetry
-        uses: snok/install-poetry@v1
+        uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1
         with:
           virtualenvs-create: true
           virtualenvs-in-project: true
@@ -60,16 +62,29 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Restore OpenRouter spend ledger
         continue-on-error: true
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: logs/openrouter_spend.json
           key: openrouter-spend-${{ github.run_id }}
           restore-keys: |
             openrouter-spend-
+      - name: Restore question attempt record
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: logs/question_attempts.json
+          key: question-attempts-${{ github.run_id }}
+          restore-keys: |
+            question-attempts-
       - name: Run bot without submitting
         run: |
-          poetry run python main.py --mode test_questions --dry-run --max-questions 1
+          if ! printf '%s\n' "$MAX_QUESTIONS" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "max_questions must be a whole number of at least 1, got: ${MAX_QUESTIONS}." >&2
+            exit 1
+          fi
+          poetry run python main.py --mode test_questions --dry-run --max-questions "$MAX_QUESTIONS"
         env:
+          MAX_QUESTIONS: "${{ format('{0}', inputs.max_questions) }}"
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
@@ -86,7 +101,22 @@ jobs:
       - name: Save OpenRouter spend ledger
         if: always() && hashFiles('logs/openrouter_spend.json') != ''
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: logs/openrouter_spend.json
           key: openrouter-spend-${{ github.run_id }}
+      - name: Show question attempt record
+        if: always()
+        run: |
+          if [ -f logs/question_attempts.json ]; then
+            python -c 'import json; d=json.load(open("logs/question_attempts.json")); q=d.get("questions") or {}; print({k: len(v) for k, v in q.items()})'
+          else
+            echo "No question attempt record."
+          fi
+      - name: Save question attempt record
+        if: always() && hashFiles('logs/question_attempts.json') != ''
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: logs/question_attempts.json
+          key: question-attempts-${{ github.run_id }}

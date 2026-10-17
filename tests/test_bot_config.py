@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -29,21 +31,30 @@ from bot_helpers import (
     SPEND_GAP_CAP_USD,
     SPEND_HARD_CAP_USD,
     SPEND_SWITCH_USD,
+    AttemptTracker,
+    SpendCapReached,
     SpendTracker,
     asknews_configured,
     call_would_pass_hard_cap,
+    clamp_monotonic_values,
     clip_and_renormalize,
     clip_probability,
     estimate_call_cost_usd,
+    failure_counts_toward_retry,
     forecaster_models,
+    forecast_bounds_text,
+    format_forecast_bounds,
     median_binary,
     median_option_probabilities,
     median_percentile_values,
     openrouter_model_id,
+    openrouter_request_body,
     recorded_call_cost_usd,
     redact_secrets,
     required_success_fraction,
+    require_max_questions,
     resolution_checklist_prompt,
+    select_questions,
     strip_market_and_crowd_odds,
     use_deepseek_only,
 )
@@ -497,10 +508,17 @@ class WorkflowTests(unittest.TestCase):
                 name,
             )
             self.assertIn(
-                "MAX_QUESTIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_questions || '' }}",
+                "MAX_QUESTIONS: \"${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_questions) || vars.MAX_QUESTIONS || '3' }}\"",
                 text,
                 name,
             )
+            self.assertIn(
+                "max_questions must be a whole number of at least 1, got: ${MAX_QUESTIONS}.",
+                text,
+                name,
+            )
+            self.assertIn("logs/question_attempts.json", text, name)
+            self.assertIn("question-attempts-${{ github.run_id }}", text, name)
             bodies = _run_script_bodies(text)
             self.assertTrue(bodies, name)
             for body in bodies:
@@ -516,6 +534,281 @@ class WorkflowTests(unittest.TestCase):
             ]
             self.assertNotIn("schedule:", active, name)
             self.assertFalse(any(line.startswith("cron:") or "- cron:" in line for line in active))
+
+    def test_actions_are_pinned_and_forecast_jobs_share_a_lock(self) -> None:
+        workflow_dir = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+        pinned = __import__("re").compile(
+            r"uses: \S+@[0-9a-f]{40} # v\S+"
+        )
+        for path in sorted(workflow_dir.glob("*.yaml")):
+            for line in path.read_text().splitlines():
+                if line.strip().startswith("#") or "uses:" not in line:
+                    continue
+                self.assertRegex(line, pinned, path.name)
+        for name in (
+            "run_bot_on_tournament.yaml",
+            "run_bot_on_metaculus_cup.yaml",
+            "test_bot.yaml",
+        ):
+            text = (workflow_dir / name).read_text()
+            self.assertIn("group: metac-bot-forecast", text, name)
+            self.assertIn("cancel-in-progress: false", text, name)
+        review = (workflow_dir / "review_bot.yaml").read_text()
+        self.assertNotIn("metac-bot-forecast", review)
+        dry_run = (workflow_dir / "test_bot.yaml").read_text()
+        self.assertRegex(
+            dry_run,
+            r"max_questions:\n[ \t]+description:.*\n[ \t]+type: number\n[ \t]+default: 1\n",
+        )
+        self.assertIn("MAX_QUESTIONS: \"${{ format('{0}', inputs.max_questions) }}\"", dry_run)
+        self.assertIn('--max-questions "$MAX_QUESTIONS"', dry_run)
+        self.assertIn(
+            "max_questions must be a whole number of at least 1, got: ${MAX_QUESTIONS}.",
+            dry_run,
+        )
+        self.assertNotIn("--max-questions 1", dry_run)
+        self.assertIn("logs/question_attempts.json", dry_run)
+        for body in _run_script_bodies(dry_run):
+            self.assertNotIn("${{", body)
+
+
+class _Question:
+    def __init__(self, question_id: int, already_forecasted: bool = False) -> None:
+        self.id_of_question = question_id
+        self.already_forecasted = already_forecasted
+
+
+class AttemptAndLimitTests(unittest.TestCase):
+    def test_one_failure_does_not_skip_and_two_within_24h_do(self) -> None:
+        now = datetime(2026, 10, 17, 12, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            tracker = AttemptTracker(path=Path(directory) / "question_attempts.json")
+            tracker.record_failure("45517", now=now - timedelta(hours=2))
+            self.assertFalse(tracker.should_skip("45517", now=now))
+            self.assertNotIn("45517", tracker.skipped_ids(now=now))
+            tracker.record_failure("45517", now=now - timedelta(hours=1))
+            self.assertTrue(tracker.should_skip("45517", now=now))
+            self.assertIn("45517", tracker.skipped_ids(now=now))
+            tracker.record_failure("45517", now=now)
+            self.assertEqual(tracker.recent_failures("45517", now=now), 2)
+
+    def test_a_failure_older_than_24h_does_not_count(self) -> None:
+        now = datetime(2026, 10, 17, 12, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            tracker = AttemptTracker(path=Path(directory) / "question_attempts.json")
+            tracker.record_failure("45517", now=now - timedelta(hours=30))
+            tracker.record_failure("45517", now=now - timedelta(hours=25))
+            self.assertFalse(tracker.should_skip("45517", now=now))
+            self.assertEqual(tracker.skipped_ids(now=now), set())
+            tracker.record_failure("9", now=now - timedelta(hours=23))
+            tracker.record_failure("9", now=now - timedelta(minutes=5))
+            self.assertTrue(tracker.should_skip("9", now=now))
+
+    def test_ledger_round_trip_stores_ids_and_times_only(self) -> None:
+        now = datetime(2026, 10, 17, 12, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "question_attempts.json"
+            tracker = AttemptTracker(path=path)
+            tracker.record_failure("45517", now=now - timedelta(hours=1))
+            loaded = AttemptTracker.load(path)
+            self.assertEqual(loaded.recent_failures("45517", now=now), 1)
+            self.assertFalse(loaded.should_skip("45517", now=now))
+            payload = json.loads(path.read_text())
+            self.assertEqual(set(payload), {"questions"})
+            self.assertEqual(list(payload["questions"]), ["45517"])
+            self.assertNotIn("sk-", path.read_text())
+
+    def test_spend_stop_is_not_a_failed_attempt(self) -> None:
+        self.assertFalse(failure_counts_toward_retry(SpendCapReached("cap")))
+        self.assertTrue(failure_counts_toward_retry(ValueError("quorum")))
+        self.assertTrue(failure_counts_toward_retry(RuntimeError("post failed")))
+        grouped = ExceptionGroup("calls", [SpendCapReached("cap")])
+        self.assertFalse(failure_counts_toward_retry(grouped))
+        mixed = ExceptionGroup("calls", [SpendCapReached("cap"), ValueError("api")])
+        self.assertTrue(failure_counts_toward_retry(mixed))
+
+    def test_limit_is_applied_after_forecasted_and_failed_questions(self) -> None:
+        questions = [
+            _Question(1, already_forecasted=True),
+            _Question(2, already_forecasted=True),
+            _Question(3),
+            _Question(4),
+            _Question(5),
+            _Question(6),
+        ]
+        chosen = select_questions(
+            questions,
+            skip_already_forecasted=True,
+            skipped_attempt_ids={"3"},
+            limit=2,
+        )
+        self.assertEqual([question.id_of_question for question in chosen], [4, 5])
+        including_done = select_questions(
+            questions,
+            skip_already_forecasted=False,
+            skipped_attempt_ids={"3"},
+            limit=2,
+        )
+        self.assertEqual([question.id_of_question for question in including_done], [1, 2])
+
+    def test_zero_or_negative_max_questions_is_rejected(self) -> None:
+        self.assertEqual(require_max_questions("3"), 3)
+        self.assertEqual(require_max_questions(" 9 "), 9)
+        for raw in ("0", "-1", "1.5", "", "no"):
+            with self.assertRaises(ValueError) as caught:
+                require_max_questions(raw)
+            self.assertIn("at least 1", str(caught.exception))
+
+
+class BoundClampTests(unittest.TestCase):
+    def test_closed_bounds_clamp_to_the_stated_range(self) -> None:
+        lower, upper = 0.095, 0.805
+        clamped = clamp_monotonic_values(
+            [0.1, 0.2, 0.3, 0.4, 0.5, 3.0],
+            lower,
+            upper,
+            False,
+            False,
+        )
+        self.assertEqual(clamped[-1], upper)
+        self.assertGreaterEqual(min(clamped), lower)
+        self.assertLessEqual(max(clamped), upper)
+        self.assertTrue(all(clamped[i] < clamped[i + 1] for i in range(len(clamped) - 1)))
+
+    def test_open_upper_bound_allows_a_small_margin_only(self) -> None:
+        lower, upper = 0.095, 0.805
+        clamped = clamp_monotonic_values(
+            [0.2, 0.3, 0.4, 0.5, 0.6, 3.0],
+            lower,
+            upper,
+            False,
+            True,
+        )
+        margin = 0.05 * (upper - lower)
+        self.assertGreater(clamped[-1], upper)
+        self.assertLessEqual(clamped[-1], upper + margin + 1e-12)
+        self.assertLess(clamped[-1], 1.0)
+        self.assertTrue(all(clamped[i] < clamped[i + 1] for i in range(len(clamped) - 1)))
+
+    def test_open_lower_bound_and_ties_stay_inside_the_range(self) -> None:
+        lower, upper = 0.095, 0.805
+        margin = 0.05 * (upper - lower)
+        opened = clamp_monotonic_values(
+            [-10, 0.2, 0.3, 0.4, 0.5, 0.6],
+            lower,
+            upper,
+            True,
+            False,
+        )
+        self.assertLess(opened[0], lower)
+        self.assertGreaterEqual(opened[0], lower - margin - 1e-12)
+        tied = clamp_monotonic_values([upper] * 6, lower, upper, False, False)
+        gap = 0.001 * (upper - lower)
+        self.assertTrue(all(lower <= value <= upper for value in tied))
+        self.assertAlmostEqual(tied[-1], upper)
+        self.assertTrue(
+            all(tied[i + 1] - tied[i] >= gap - 1e-9 for i in range(len(tied) - 1))
+        )
+
+    def test_bounds_text_states_the_range_and_which_sides_are_open(self) -> None:
+        text = format_forecast_bounds(
+            lower="0.095",
+            upper="0.805",
+            allowed_low="0.095",
+            allowed_high="0.8405",
+            open_lower=False,
+            open_upper=True,
+        )
+        self.assertIn("Allowed range", text)
+        self.assertIn("0.095", text)
+        self.assertIn("0.805", text)
+        self.assertIn("0.8405", text)
+        self.assertIn("closed", text)
+        self.assertIn("open", text)
+
+    def test_log_scale_open_lower_bound_stays_positive_and_above_zero_point(self) -> None:
+        lower, upper, zero_point = 1.0, 1_000_000.0, 0.0
+        ratio = (upper - zero_point) / (lower - zero_point)
+        expected_low = lower + (upper - lower) * (ratio ** -0.05 - 1) / (ratio - 1)
+        allowed_low, allowed_high = bot_helpers.allowed_value_range(
+            lower,
+            upper,
+            True,
+            False,
+            zero_point=zero_point,
+            floor_non_negative=True,
+        )
+        self.assertAlmostEqual(allowed_low, expected_low, places=6)
+        self.assertGreater(allowed_low, 0.4)
+        self.assertLess(allowed_low, lower)
+        self.assertEqual(allowed_high, upper)
+        clamped = clamp_monotonic_values(
+            [-50_000, 10, 100, 1_000, 10_000, 2_000_000],
+            lower,
+            upper,
+            True,
+            False,
+            zero_point=zero_point,
+            floor_non_negative=True,
+        )
+        self.assertGreaterEqual(min(clamped), allowed_low - 1e-9)
+        self.assertLessEqual(max(clamped), upper)
+        self.assertTrue(all(value > zero_point for value in clamped))
+        self.assertTrue(all(value > 0 for value in clamped))
+        dipped = bot_helpers.allowed_value_range(
+            1.0,
+            100.0,
+            True,
+            False,
+            zero_point=-50.0,
+            floor_non_negative=True,
+        )
+        self.assertGreaterEqual(dipped[0], 0.0)
+        self.assertGreater(dipped[0], -50.0)
+        prompt = forecast_bounds_text(
+            lower=lower,
+            upper=upper,
+            open_lower=True,
+            open_upper=False,
+            zero_point=zero_point,
+            floor_non_negative=True,
+        )
+        self.assertIn("Allowed range", prompt)
+        self.assertIn("open", prompt)
+        self.assertIn("closed", prompt)
+        self.assertNotIn("between -", prompt)
+        self.assertIn(f"{allowed_low:.6g}", prompt)
+
+    def test_reasoning_request_asks_for_high_effort_and_leaves_routing_alone(self) -> None:
+        body = openrouter_request_body(reasoning=True)
+        self.assertEqual(body, {"reasoning": {"effort": "high", "enabled": True}})
+        self.assertNotIn("provider", body)
+        quiet = openrouter_request_body(reasoning=False)
+        self.assertEqual(quiet, {"reasoning": {"effort": "none", "enabled": False}})
+        self.assertNotIn("provider", quiet)
+
+    def test_deepseek_reservation_covers_an_expensive_host(self) -> None:
+        forecast = estimate_call_cost_usd(OPENROUTER_DEEPSEEK_V4_PRO, "forecast")
+        checklist = estimate_call_cost_usd(OPENROUTER_DEEPSEEK_V4_PRO, "checklist")
+        self.assertGreaterEqual(forecast, 0.019)
+        self.assertGreaterEqual(checklist, 0.019)
+        near_cap = SpendTracker(
+            path=Path("/tmp/does-not-matter-deepseek.json"),
+            remote_usd=SPEND_HARD_CAP_USD - forecast + 0.001,
+            gap_usd=0.0,
+            fetch_usage=lambda: None,
+            usage_known=True,
+        )
+        self.assertFalse(near_cap.try_reserve(forecast))
+        room = SpendTracker(
+            path=Path("/tmp/does-not-matter-deepseek-room.json"),
+            remote_usd=SPEND_HARD_CAP_USD - forecast - 0.001,
+            gap_usd=0.0,
+            fetch_usage=lambda: None,
+            usage_known=True,
+        )
+        self.assertTrue(room.try_reserve(forecast))
+        self.assertAlmostEqual(room.reserved_usd, forecast)
 
 
 def _run_script_bodies(text: str) -> list[str]:
