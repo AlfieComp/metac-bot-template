@@ -1,7 +1,16 @@
 name: Test Bot
 
 on:
+  pull_request:
   workflow_dispatch:
+    inputs:
+      live_dry_run:
+        description: "Forecast one bot-testing-area question without submitting (spends OpenRouter credit)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -9,12 +18,12 @@ concurrency:
   cancel-in-progress: false
 
 
-# Daily job to run the simple forecast bot
+# Unit tests do not call Metaculus, OpenRouter, or AskNews.
+# The optional live dry run forecasts one question and does not publish it.
 jobs:
-  forecast_job:
-    runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
-    steps: # sets up the steps that will be run in order
-      # setup repository with all necessary dependencies - keep as is
+  unit_tests:
+    runs-on: ubuntu-latest
+    steps:
       - name: Check out repository
         uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,26 +35,58 @@ jobs:
           virtualenvs-create: true
           virtualenvs-in-project: true
           installer-parallel: true
-      # Adding the below will make the workflow faster, but will mean you don't automatically get updates from forecasting-tools and other packages
-      # - name: Load cached venv
-      #   id: cached-poetry-dependencies
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: .venv
-      #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
-      - name: Run bot
+      - name: Run unit tests
+        run: poetry run python -m unittest discover -s tests -t . -v
+
+  live_dry_run:
+    if: github.event_name == 'workflow_dispatch' && inputs.live_dry_run
+    needs: unit_tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Restore OpenRouter spend ledger
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: logs/openrouter_spend.json
+          key: openrouter-spend-${{ github.run_id }}
+          restore-keys: |
+            openrouter-spend-
+      - name: Run bot without submitting
         run: |
-          poetry run python main.py --mode test_questions
-        # this reads the environment variables from the github repository.
-        # Store under Settings --> Secrets and variables --> Actions
+          poetry run python main.py --mode test_questions --dry-run --max-questions 1
         env:
-          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }} # replace this with the name of the variable under which you stored your own Metaculus token
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+      - name: Show spend ledger
+        if: always()
+        run: |
+          if [ -f logs/openrouter_spend.json ]; then
+            python -c 'import json; d=json.load(open("logs/openrouter_spend.json")); print({k: d[k] for k in ("remote_usd", "gap_usd", "usage_known") if k in d})'
+          else
+            echo "No spend ledger. Forecasting is refused when OpenRouter usage is unknown."
+          fi
+      - name: Save OpenRouter spend ledger
+        if: always() && hashFiles('logs/openrouter_spend.json') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: logs/openrouter_spend.json
+          key: openrouter-spend-${{ github.run_id }}

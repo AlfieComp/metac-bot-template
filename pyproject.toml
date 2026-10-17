@@ -22,7 +22,7 @@ optional = true
 
 [tool.poetry.group.integrations.dependencies]
 lightningrod-ai = "^0.1.14"
-metaculus-bot-review = "^0.1.1"
+metaculus-bot-review = "==0.1.2"
 
 
 [tool.poetry.group.dev.dependencies]

@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import contextvars
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -8,10 +10,32 @@ import dotenv
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
+    FORECAST_GUARDRAIL,
+    FORECASTER_ANGLES,
+    GEMINI_MAX_TOKENS,
+    OPENROUTER_DEEPSEEK_V4_FLASH,
+    OPENROUTER_DEEPSEEK_V4_PRO,
+    OPENROUTER_GEMINI_36_FLASH,
+    PERCENTILE_HEIGHTS,
+    SPEND_HARD_CAP_USD,
+    SPEND_SWITCH_USD,
+    SpendCapReached,
+    SpendTracker,
+    asknews_configured,
     check_environment,
+    clip_probability,
+    estimate_call_cost_usd,
+    forecaster_models,
+    median_option_probabilities,
+    median_percentile_values,
     print_run_summary_banner,
     print_startup_banner,
+    recorded_call_cost_usd,
+    redact_secrets,
+    required_success_fraction,
+    resolution_checklist_prompt,
     silence_noisy_dependencies,
+    strip_market_and_crowd_odds,
 )
 
 silence_noisy_dependencies()
@@ -23,9 +47,13 @@ from forecasting_tools import (
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
+    MonetaryCostManager,
     MultipleChoiceQuestion,
+    MultipleChoiceReport,
+    PredictedOption,
     NumericDistribution,
     NumericQuestion,
+    NumericReport,
     DateQuestion,
     DatePercentile,
     Percentile,
@@ -36,7 +64,6 @@ from forecasting_tools import (
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
-    SmartSearcher,
     clean_indents,
     structure_output,
 )
@@ -44,16 +71,96 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+# Set inside each of the five forecasts so nested conditional questions reuse
+# that seat's model instead of taking another one.
+_FORECASTER_SLOT: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "forecaster_slot", default=None
+)
+
+_GEMINI_MAX_TOKENS = GEMINI_MAX_TOKENS
+_REASONING_MAX_TOKENS = 6000
+_PARSER_MAX_TOKENS = 2000
+_USAGE_UNKNOWN = (
+    "OpenRouter usage could not be read and there is no saved spend record. "
+    "Refusing to forecast."
+)
+
+
+def _install_median_multiple_choice_aggregation() -> None:
+    """The template averages multiple-choice options. This bot takes the median."""
+
+    async def aggregate(
+        cls, predictions: list[PredictedOptionList], question: MultipleChoiceQuestion
+    ) -> PredictedOptionList:
+        del cls, question
+        merged = median_option_probabilities(
+            [prediction.to_dict() for prediction in predictions]
+        )
+        return PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name=name, probability=probability)
+                for name, probability in merged.items()
+            ]
+        )
+
+    MultipleChoiceReport.aggregate_predictions = classmethod(aggregate)  # type: ignore[method-assign]
+
+
+def _install_median_numeric_aggregation() -> None:
+    """Median the outcome value at each percentile, including date and conditional questions."""
+
+    async def aggregate(cls, predictions: list[NumericDistribution], question):
+        del cls
+        if not predictions:
+            raise ValueError("No predictions to aggregate")
+        forecasts = []
+        for prediction in predictions:
+            points = prediction.get_percentiles_at_target_heights(list(PERCENTILE_HEIGHTS))
+            forecasts.append([(point.percentile, point.value) for point in points])
+        merged = median_percentile_values(forecasts, PERCENTILE_HEIGHTS)
+        percentiles = [
+            Percentile(percentile=height, value=value) for height, value in merged
+        ]
+        return NumericDistribution.from_question(percentiles, question)
+
+    NumericReport.aggregate_predictions = classmethod(aggregate)  # type: ignore[method-assign]
+
+
+_install_median_multiple_choice_aggregation()
+_install_median_numeric_aggregation()
+
+
+def _looks_like_unsupported_parameter(exc: BaseException) -> bool:
+    if type(exc).__name__ != "BadRequestError":
+        return False
+    text = redact_secrets(str(exc)).lower()
+    needles = (
+        "reasoning",
+        "extra_body",
+        "unknown parameter",
+        "invalid parameter",
+        "does not support",
+        "unsupported parameter",
+    )
+    return any(needle in text for needle in needles)
+
 
 class FallTemplateBot2026(ForecastBot):
     """
-    This is the template bot for the Fall 2026 FutureEval Bot Tournament.
+    Fall 2026 template bot, with a five-model OpenRouter ensemble.
+
+    The final forecast is the median of five reasoned forecasts: Gemini 3.6 Flash
+    three times, Kimi K3 once, and DeepSeek V4 Pro once. DeepSeek V4 Flash parses
+    the output. One Gemini call checks the resolution criteria and fine print
+    before those forecasts. Once recorded OpenRouter spend reaches US$3.50 the
+    checklist and the five forecasts switch to DeepSeek V4 Pro. Calls stop at US$4.50.
+
     This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
     This template is given as-is, and is use-at-your-own-risk.
     We have covered most test cases in forecasting-tools it may be worth double checking key components locally.
     So far our track record has been 1 mentionable bug per season (affecting forecasts for 1-2% of total questions)
 
-    This bot is identical to SummerTemplateBot2026.
+    The forecast prompts started from SummerTemplateBot2026. The model roster, the resolution checklist, and the spend cap are specific to this fork.
 
     The main entry point of this bot is `bot.forecast_on_tournament(tournament_id)` in the parent class.
     See the script at the bottom of the file for more details on how to run the bot.
@@ -126,67 +233,340 @@ class FallTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    def __init__(self, *, spend_tracker: SpendTracker | None = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.spend = spend_tracker or SpendTracker.load()
+        # At least three of the five forecasts must succeed or the question is skipped.
+        self.required_successful_predictions = required_success_fraction(
+            self.expected_total_predictions
+        )
+        # The research string already includes the checklist. A second summary
+        # call would spend more and is not part of the ensemble.
+        self.enable_summarize_research = False
+        self.question_limit: int | None = None
+        # threading.Lock so the counter stays valid across the two asyncio.run
+        # calls (tournament, then MiniBench).
+        self._slot_lock = threading.Lock()
+        self._next_slot = 0
+        self._limiter_loop: asyncio.AbstractEventLoop | None = None
+        self._limiter_for_loop: asyncio.Semaphore | None = None
+        self._mixed_roster = [
+            self._make_llm(model, max_tokens=self._max_tokens_for(model), reasoning=True)
+            for model in forecaster_models(0.0)
+        ]
+        self._deepseek_roster = [
+            self._make_llm(
+                OPENROUTER_DEEPSEEK_V4_PRO,
+                max_tokens=_REASONING_MAX_TOKENS,
+                reasoning=True,
+            )
+            for _ in range(5)
+        ]
+        self._checklist_gemini = self._make_llm(
+            OPENROUTER_GEMINI_36_FLASH,
+            max_tokens=_GEMINI_MAX_TOKENS,
+            reasoning=True,
+        )
+        self._checklist_deepseek = self._make_llm(
+            OPENROUTER_DEEPSEEK_V4_PRO,
+            max_tokens=_REASONING_MAX_TOKENS,
+            reasoning=True,
+        )
+        self._parser = self._make_llm(
+            OPENROUTER_DEEPSEEK_V4_FLASH,
+            max_tokens=_PARSER_MAX_TOKENS,
+            reasoning=False,
+        )
+        self.set_llm(self._parser, "parser")
+        self.set_llm("no_research", "researcher")
+
+    @staticmethod
+    def _max_tokens_for(model: str) -> int:
+        if OPENROUTER_GEMINI_36_FLASH in model:
+            return _GEMINI_MAX_TOKENS
+        return _REASONING_MAX_TOKENS
+
+    @staticmethod
+    def _make_llm(model: str, *, max_tokens: int, reasoning: bool) -> GeneralLlm:
+        # OpenRouter's unified reasoning field. "high" is on for every forecaster.
+        # The parser only formats, so reasoning is off.
+        extra_body = (
+            {"reasoning": {"effort": "high", "enabled": True}}
+            if reasoning
+            else {"reasoning": {"effort": "none", "enabled": False}}
+        )
+        return GeneralLlm(
+            model=model,
+            temperature=1 if reasoning else 0,
+            timeout=180 if reasoning else 90,
+            allowed_tries=2,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
+        )
+
+    def _roster(self) -> list[GeneralLlm]:
+        if self.spend.deepseek_only():
+            return self._deepseek_roster
+        return self._mixed_roster
+
+    def _claim_forecaster_slot(self) -> int:
+        with self._slot_lock:
+            slot = self._next_slot
+            self._next_slot += 1
+            return slot
+
+    def _question_limiter(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if self._limiter_for_loop is None or self._limiter_loop is not loop:
+            self._limiter_for_loop = asyncio.Semaphore(self._max_concurrent_questions)
+            self._limiter_loop = loop
+        return self._limiter_for_loop
+
+    def _current_forecaster(self) -> GeneralLlm:
+        roster = self._roster()
+        slot = _FORECASTER_SLOT.get()
+        if slot is None:
+            slot = 0
+        return roster[slot % len(roster)]
+
+    def _forecast_angle_block(self) -> str:
+        slot = _FORECASTER_SLOT.get()
+        if slot is None:
+            slot = 0
+        angle = FORECASTER_ANGLES[slot % len(FORECASTER_ANGLES)]
+        model = self._current_forecaster().model
+        return clean_indents(
+            f"""
+            How to approach this forecast ({model}):
+            {angle}
+
+            {FORECAST_GUARDRAIL}
+            """
+        )
+
+    async def _invoke_llm(self, llm: GeneralLlm, prompt: str) -> str:
+        try:
+            return await llm.invoke(prompt)
+        except Exception as exc:
+            if not _looks_like_unsupported_parameter(exc):
+                raise
+            logger.warning(
+                "Model %s rejected a request setting (%s). Retrying without the reasoning override.",
+                llm.model,
+                type(exc).__name__,
+            )
+            fallback = GeneralLlm(
+                model=llm.model,
+                temperature=1,
+                timeout=llm.litellm_kwargs.get("timeout") or 180,
+                allowed_tries=1,
+                max_tokens=llm.litellm_kwargs.get("max_tokens"),
+            )
+            return await fallback.invoke(prompt)
+
+    async def _metered(
+        self, llm: GeneralLlm, prompt: str, *, purpose: str, kind: str
+    ) -> str:
+        estimate = estimate_call_cost_usd(llm.model, kind)
+        return await self._metered_awaitable(
+            purpose, estimate, self._invoke_llm(llm, prompt)
+        )
+
+    async def _metered_parser(self, awaitable):
+        estimate = estimate_call_cost_usd(OPENROUTER_DEEPSEEK_V4_FLASH, "forecast")
+        return await self._metered_awaitable(
+            f"parser:{OPENROUTER_DEEPSEEK_V4_FLASH}", estimate, awaitable
+        )
+
+    def _close_awaitable(self, awaitable) -> None:
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+
+    def _raise_spend_block(self, purpose: str, estimate: float) -> None:
+        if not self.spend.usage_known:
+            raise SpendCapReached(_USAGE_UNKNOWN)
+        raise SpendCapReached(
+            f"OpenRouter spend is ${self.spend.effective_usd():.4f}. "
+            f"Another {purpose} call is estimated at ${estimate:.4f}, "
+            f"which would pass the ${SPEND_HARD_CAP_USD:.2f} cap."
+        )
+
+    async def _metered_awaitable(self, purpose: str, estimate: float, awaitable):
+        # Hold the estimate before the call so parallel forecasts cannot all pass the stop.
+        if not self.spend.try_reserve(estimate):
+            self._close_awaitable(awaitable)
+            self._raise_spend_block(purpose, estimate)
+        succeeded = False
+        measured = 0.0
+        try:
+            with MonetaryCostManager() as meter:
+                try:
+                    result = await awaitable
+                    succeeded = True
+                finally:
+                    measured = float(meter.current_usage)
+            return result
+        finally:
+            amount = recorded_call_cost_usd(measured, estimate, succeeded)
+            source = "measured" if succeeded and measured > 0 else "estimate"
+            self.spend.settle_reservation(estimate, amount)
+            self.spend.refresh()
+            logger.info(
+                "LLM call purpose=%s cost_usd=%.6f cost_source=%s spend_usd=%.4f mode=%s succeeded=%s",
+                purpose,
+                amount,
+                source,
+                self.spend.effective_usd(),
+                self.spend.mode_label(),
+                succeeded,
+            )
+
+    async def _invoke_forecaster(self, prompt: str) -> str:
+        llm = self._current_forecaster()
+        return await self._metered(
+            llm, prompt, purpose=f"forecast:{llm.model}", kind="forecast"
+        )
+
+    async def forecast_questions(
+        self,
+        questions,
+        return_exceptions: bool = False,
+    ):
+        self.spend.refresh()
+        if self.question_limit is not None:
+            questions = list(questions)[: self.question_limit]
+            logger.info("Limiting this run to %s question(s).", self.question_limit)
+        if not self.spend.usage_known:
+            logger.error(_USAGE_UNKNOWN)
+            if return_exceptions:
+                return [SpendCapReached(_USAGE_UNKNOWN)]
+            raise SpendCapReached(_USAGE_UNKNOWN)
+        if self.spend.over_hard_cap():
+            message = (
+                f"OpenRouter spend is ${self.spend.effective_usd():.4f}, "
+                "which is at the US$4.50 cap. No further questions will be forecast."
+            )
+            logger.error(message)
+            if return_exceptions:
+                return [SpendCapReached(message)]
+            raise SpendCapReached(message)
+        logger.info(
+            "OpenRouter spend_usd=%.4f mode=%s",
+            self.spend.effective_usd(),
+            self.spend.mode_label(),
+        )
+        return await super().forecast_questions(questions, return_exceptions)
+
+    async def _run_individual_question(self, question: MetaculusQuestion):
+        async with self._question_limiter():
+            self._next_slot = 0
+            self.spend.refresh()
+            if not self.spend.usage_known:
+                raise SpendCapReached(_USAGE_UNKNOWN)
+            if self.spend.over_hard_cap():
+                raise SpendCapReached(
+                    f"OpenRouter spend is ${self.spend.effective_usd():.4f}, "
+                    "which is at the US$4.50 cap."
+                )
+            logger.info(
+                "Question %s spend_usd=%.4f mode=%s",
+                question.page_url,
+                self.spend.effective_usd(),
+                self.spend.mode_label(),
+            )
+            try:
+                return await super()._run_individual_question(question)
+            finally:
+                self.spend.refresh()
+
+    async def _make_prediction(
+        self, question: MetaculusQuestion, research: str
+    ) -> ReasonedPrediction[PredictionTypes]:
+        if _FORECASTER_SLOT.get() is not None:
+            return await super()._make_prediction(question, research)
+        slot = self._claim_forecaster_slot()
+        token = _FORECASTER_SLOT.set(slot)
+        try:
+            return await super()._make_prediction(question, research)
+        finally:
+            _FORECASTER_SLOT.reset(token)
+
+    async def _aggregate_predictions(
+        self,
+        predictions,
+        question: MetaculusQuestion,
+    ):
+        aggregate = await super()._aggregate_predictions(predictions, question)
+        if isinstance(aggregate, float):
+            return clip_probability(aggregate)
+        return aggregate
+
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
-
-            prompt = self._get_research_prompt(question, researcher)
-
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-            return research
-
-    @staticmethod
-    def _get_research_prompt(
-        question: MetaculusQuestion, researcher: str | GeneralLlm
-    ) -> str:
-        if GeneralLlm.to_model_name(researcher) == "asknews/news-summaries":
-            return question.question_text
-
-        prompt = clean_indents(
+        news = await self._collect_asknews(question)
+        checklist = await self._resolution_checklist(question)
+        research = clean_indents(
             f"""
-            You are an assistant to a superforecaster.
-            The superforecaster will give you a question they intend to forecast on.
-            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-            You do not produce forecasts yourself.
+            ## Resolution checklist (binding)
+            {checklist}
 
-            Question:
-            {question.question_text}
-
-            This question's outcome will be determined by the specific criteria below:
-            {question.resolution_criteria}
-
-            {question.fine_print}
+            ## News
+            {news}
             """
         )
-        return prompt
+        logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+        return research
+
+    async def _collect_asknews(self, question: MetaculusQuestion) -> str:
+        if not asknews_configured():
+            logger.info(
+                "AskNews credentials are not set. Skipping news research for %s.",
+                question.page_url,
+            )
+            return (
+                "No news briefing. AskNews credentials were not set, so news "
+                "research was skipped."
+            )
+        try:
+            # One news search per question (latest plus the archive lookup the
+            # official searcher already pairs with it). Free tier; no LLM spend.
+            raw = await AskNewsSearcher().get_formatted_news_async(question.question_text)
+        except Exception as exc:
+            logger.warning(
+                "AskNews research failed (%s). Continuing without news. %s",
+                type(exc).__name__,
+                redact_secrets(str(exc)),
+            )
+            return "No news briefing. AskNews was unavailable for this question."
+        stripped, removed = strip_market_and_crowd_odds(raw)
+        if removed:
+            logger.info(
+                "Removed %s research line(s) that stated crowd or market odds.",
+                removed,
+            )
+        return stripped or "AskNews returned no articles."
+
+    async def _resolution_checklist(self, question: MetaculusQuestion) -> str:
+        self.spend.refresh()
+        if self.spend.deepseek_only():
+            llm = self._checklist_deepseek
+        else:
+            llm = self._checklist_gemini
+        prompt = resolution_checklist_prompt(
+            question_text=question.question_text,
+            resolution_criteria=question.resolution_criteria or "",
+            fine_print=question.fine_print or "",
+            background=question.background_info or "",
+            today=datetime.now().strftime("%Y-%m-%d"),
+        )
+        return await self._metered(
+            llm,
+            clean_indents(prompt),
+            purpose=f"checklist:{llm.model}",
+            kind="checklist",
+        )
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -213,6 +593,8 @@ class FallTemplateBot2026(ForecastBot):
             Your research assistant says:
             {research}
 
+            {self._forecast_angle_block()}
+
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
             Before answering you write:
@@ -235,7 +617,7 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -243,14 +625,14 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        binary_prediction: BinaryPrediction = await structure_output(
+        binary_prediction: BinaryPrediction = await self._metered_parser(structure_output(
             reasoning,
             BinaryPrediction,
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
-        )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        ))
+        decimal_pred = clip_probability(binary_prediction.prediction_in_decimal)
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
@@ -282,6 +664,8 @@ class FallTemplateBot2026(ForecastBot):
 
             Your research assistant says:
             {research}
+
+            {self._forecast_angle_block()}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -317,15 +701,15 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
+        predicted_option_list: PredictedOptionList = await self._metered_parser(structure_output(
             text_to_structure=reasoning,
             output_type=PredictedOptionList,
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
-        )
+        ))
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
@@ -360,6 +744,8 @@ class FallTemplateBot2026(ForecastBot):
 
             Your research assistant says:
             {research}
+
+            {self._forecast_angle_block()}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -400,7 +786,7 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -417,13 +803,13 @@ class FallTemplateBot2026(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
-        percentile_list: list[Percentile] = await structure_output(
+        percentile_list: list[Percentile] = await self._metered_parser(structure_output(
             reasoning,
             list[Percentile],
             model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
-        )
+        ))
         prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
@@ -454,6 +840,8 @@ class FallTemplateBot2026(ForecastBot):
 
             Your research assistant says:
             {research}
+
+            {self._forecast_angle_block()}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -496,7 +884,7 @@ class FallTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -509,13 +897,13 @@ class FallTemplateBot2026(ForecastBot):
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             """
         )
-        date_percentile_list: list[DatePercentile] = await structure_output(
+        date_percentile_list: list[DatePercentile] = await self._metered_parser(structure_output(
             reasoning,
             list[DatePercentile],
             model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
-        )
+        ))
 
         percentile_list = [
             Percentile(
@@ -697,36 +1085,52 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Forecast without publishing to Metaculus",
+    )
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=None,
+        help="Forecast at most this many open questions in each tournament",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+    if args.max_questions is not None and args.max_questions < 1:
+        parser.error("--max-questions must be at least 1")
 
     check_environment(strict=True)
-    publish_to_metaculus = True
+    publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    spend_tracker = SpendTracker.load()
+    spend_tracker.refresh()
+    if not spend_tracker.usage_known:
+        print(_USAGE_UNKNOWN + "\n")
+    else:
+        print(
+            f"OpenRouter spend so far ${spend_tracker.effective_usd():.4f}. "
+            f"Mixed ensemble until ${SPEND_SWITCH_USD:.2f}, "
+            f"hard stop at ${SPEND_HARD_CAP_USD:.2f}. "
+            f"Next question mode: {spend_tracker.mode_label()}.\n"
+        )
+
+    # Five forecasts per question, combined by median. Models, the parser,
+    # and the resolution checklist are pinned inside FallTemplateBot2026.
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
+        enable_summarize_research=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        spend_tracker=spend_tracker,
     )
+    template_bot.question_limit = args.max_questions
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
@@ -775,6 +1179,11 @@ if __name__ == "__main__":
             )
         )
 
+    template_bot.spend.refresh()
+    print(
+        f"OpenRouter spend recorded: ${template_bot.spend.effective_usd():.4f} "
+        f"({template_bot.spend.mode_label()}).\n"
+    )
     template_bot.log_report_summary(forecast_reports)
     print_run_summary_banner(
         forecast_reports,
