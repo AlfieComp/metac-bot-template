@@ -19,9 +19,10 @@ on:
   # schedule:
   #   - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
 
-# Add concurrency group to prevent parallel runs
+# Shared with the Cup and Test Bot dry run so those jobs cannot overwrite
+# each other's spend or attempt cache. Cancelled runs are left in place.
 concurrency:
-  group: ${{ github.workflow }}
+  group: metac-bot-forecast
   cancel-in-progress: false
 
 
@@ -32,12 +33,12 @@ jobs:
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
-        uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
       - name: Install poetry
-        uses: snok/install-poetry@v1
+        uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1
         with:
           virtualenvs-create: true
           virtualenvs-in-project: true
@@ -45,7 +46,7 @@ jobs:
       # Adding the below will make the workflow faster, but will mean you don't automatically get updates from forecasting-tools and other packages
       # - name: Load cached venv
       #   id: cached-poetry-dependencies
-      #   uses: actions/cache@v6
+      #   uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       #   with:
       #     path: .venv
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
@@ -53,7 +54,7 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Restore OpenRouter spend ledger
         continue-on-error: true
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: logs/openrouter_spend.json
           key: openrouter-spend-${{ github.run_id }}
@@ -61,7 +62,7 @@ jobs:
             openrouter-spend-
       - name: Restore question attempt record
         continue-on-error: true
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: logs/question_attempts.json
           key: question-attempts-${{ github.run_id }}
@@ -69,23 +70,25 @@ jobs:
             question-attempts-
       - name: Run bot
         # A manual run defaults to a dry run of 3 questions. A schedule, once
-        # the cron above is restored, submits and stops after 5 questions
-        # (or the MAX_QUESTIONS repository variable). The limit is applied
-        # after questions that were already forecast, or that failed twice
-        # in the last 24 hours, have been skipped.
+        # the cron above is restored, submits and stops after 3 questions
+        # unless the MAX_QUESTIONS repository variable is set. The limit is
+        # applied after questions that were already forecast, or that failed
+        # twice in the last 24 hours, have been skipped.
         run: |
           args=()
           if [ "$DRY_RUN" = "true" ]; then
             args+=(--dry-run)
           fi
-          if [ -n "$MAX_QUESTIONS" ]; then
-            args+=(--max-questions "$MAX_QUESTIONS")
+          if ! printf '%s\n' "$MAX_QUESTIONS" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "max_questions must be a whole number of at least 1, got: ${MAX_QUESTIONS}." >&2
+            exit 1
           fi
+          args+=(--max-questions "$MAX_QUESTIONS")
           poetry run python main.py "${args[@]}"
         # Secrets stay in the environment. Do not print them.
         env:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
-          MAX_QUESTIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_questions || vars.MAX_QUESTIONS || '5' }}
+          MAX_QUESTIONS: "${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_questions) || vars.MAX_QUESTIONS || '3' }}"
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
@@ -102,7 +105,7 @@ jobs:
       - name: Save OpenRouter spend ledger
         if: always() && hashFiles('logs/openrouter_spend.json') != ''
         continue-on-error: true
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: logs/openrouter_spend.json
           key: openrouter-spend-${{ github.run_id }}
@@ -117,7 +120,7 @@ jobs:
       - name: Save question attempt record
         if: always() && hashFiles('logs/question_attempts.json') != ''
         continue-on-error: true
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: logs/question_attempts.json
           key: question-attempts-${{ github.run_id }}

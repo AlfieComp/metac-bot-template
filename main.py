@@ -30,6 +30,7 @@ from bot_helpers import (
     estimate_call_cost_usd,
     failure_counts_toward_retry,
     forecaster_models,
+    forecast_bounds_text,
     format_forecast_bounds,
     median_option_probabilities,
     median_percentile_values,
@@ -38,6 +39,7 @@ from bot_helpers import (
     print_startup_banner,
     question_attempt_key,
     recorded_call_cost_usd,
+    require_max_questions,
     redact_secrets,
     required_success_fraction,
     resolution_checklist_prompt,
@@ -133,6 +135,8 @@ def _install_median_numeric_aggregation() -> None:
             upper,
             bool(question.open_lower_bound),
             bool(question.open_upper_bound),
+            zero_point=getattr(question, "zero_point", None),
+            floor_non_negative=_floor_non_negative(question),
         )
         percentiles = [
             Percentile(percentile=height, value=value)
@@ -149,6 +153,13 @@ def _question_bound_numbers(question) -> tuple[float, float]:
     if hasattr(lower, "timestamp"):
         return float(lower.timestamp()), float(upper.timestamp())
     return float(lower), float(upper)
+
+
+def _floor_non_negative(question) -> bool:
+    lower = question.lower_bound
+    if hasattr(lower, "timestamp"):
+        return False
+    return float(lower) >= 0
 
 
 def _as_utc_text(moment: datetime) -> str:
@@ -1047,29 +1058,33 @@ class FallTemplateBot2026(ForecastBot):
     def _bounds_prompt(self, question: NumericQuestion | DateQuestion) -> str:
         """State the allowed range. The same prompt is used for every roster, including DeepSeek-only."""
         lower, upper = _question_bound_numbers(question)
-        allowed_low, allowed_high = allowed_value_range(
-            lower,
-            upper,
-            bool(question.open_lower_bound),
-            bool(question.open_upper_bound),
-        )
+        open_lower = bool(question.open_lower_bound)
+        open_upper = bool(question.open_upper_bound)
+        zero_point = getattr(question, "zero_point", None)
         if isinstance(question, DateQuestion):
+            allowed_low, allowed_high = allowed_value_range(
+                lower,
+                upper,
+                open_lower,
+                open_upper,
+                zero_point=zero_point,
+            )
             return format_forecast_bounds(
                 lower=_as_utc_text(question.lower_bound),
                 upper=_as_utc_text(question.upper_bound),
                 allowed_low=_as_utc_text(datetime.fromtimestamp(allowed_low, tz=timezone.utc)),
                 allowed_high=_as_utc_text(datetime.fromtimestamp(allowed_high, tz=timezone.utc)),
-                open_lower=bool(question.open_lower_bound),
-                open_upper=bool(question.open_upper_bound),
+                open_lower=open_lower,
+                open_upper=open_upper,
             )
-        unit = f" {question.unit_of_measure}" if question.unit_of_measure else ""
-        return format_forecast_bounds(
-            lower=f"{question.lower_bound}{unit}",
-            upper=f"{question.upper_bound}{unit}",
-            allowed_low=f"{allowed_low}{unit}",
-            allowed_high=f"{allowed_high}{unit}",
-            open_lower=bool(question.open_lower_bound),
-            open_upper=bool(question.open_upper_bound),
+        return forecast_bounds_text(
+            lower=float(question.lower_bound),
+            upper=float(question.upper_bound),
+            open_lower=open_lower,
+            open_upper=open_upper,
+            zero_point=zero_point,
+            floor_non_negative=_floor_non_negative(question),
+            unit=question.unit_of_measure or "",
         )
 
     def _clamp_percentile_values(
@@ -1082,6 +1097,8 @@ class FallTemplateBot2026(ForecastBot):
             upper,
             bool(question.open_lower_bound),
             bool(question.open_upper_bound),
+            zero_point=getattr(question, "zero_point", None),
+            floor_non_negative=_floor_non_negative(question),
         )
         if any(abs(old - new) > 1e-9 for old, new in zip(values, clamped)):
             logger.info(
@@ -1230,8 +1247,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
-    if args.max_questions is not None and args.max_questions < 1:
-        parser.error("--max-questions must be at least 1")
+    if args.max_questions is not None:
+        try:
+            args.max_questions = require_max_questions(str(args.max_questions))
+        except ValueError as exc:
+            parser.error(str(exc))
 
     check_environment(strict=True)
     publish_to_metaculus = not args.dry_run

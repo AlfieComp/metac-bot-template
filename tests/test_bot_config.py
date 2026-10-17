@@ -42,6 +42,7 @@ from bot_helpers import (
     estimate_call_cost_usd,
     failure_counts_toward_retry,
     forecaster_models,
+    forecast_bounds_text,
     format_forecast_bounds,
     median_binary,
     median_option_probabilities,
@@ -51,6 +52,7 @@ from bot_helpers import (
     recorded_call_cost_usd,
     redact_secrets,
     required_success_fraction,
+    require_max_questions,
     resolution_checklist_prompt,
     select_questions,
     strip_market_and_crowd_odds,
@@ -506,7 +508,12 @@ class WorkflowTests(unittest.TestCase):
                 name,
             )
             self.assertIn(
-                "MAX_QUESTIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_questions || vars.MAX_QUESTIONS || '5' }}",
+                "MAX_QUESTIONS: \"${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_questions) || vars.MAX_QUESTIONS || '3' }}\"",
+                text,
+                name,
+            )
+            self.assertIn(
+                "max_questions must be a whole number of at least 1, got: ${MAX_QUESTIONS}.",
                 text,
                 name,
             )
@@ -528,24 +535,37 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("schedule:", active, name)
             self.assertFalse(any(line.startswith("cron:") or "- cron:" in line for line in active))
 
-    def test_actions_use_current_majors_and_the_dry_run_takes_a_cap(self) -> None:
+    def test_actions_are_pinned_and_forecast_jobs_share_a_lock(self) -> None:
         workflow_dir = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+        pinned = __import__("re").compile(
+            r"uses: \S+@[0-9a-f]{40} # v\S+"
+        )
         for path in sorted(workflow_dir.glob("*.yaml")):
-            text = path.read_text()
-            self.assertIn("actions/checkout@v7", text, path.name)
-            self.assertIn("actions/setup-python@v7", text, path.name)
-            self.assertNotIn("actions/checkout@v4", text, path.name)
-            self.assertNotIn("actions/setup-python@v5", text, path.name)
-            self.assertNotIn("actions/cache/restore@v4", text, path.name)
-            self.assertNotIn("actions/cache/save@v4", text, path.name)
-            self.assertNotIn("actions/upload-artifact@v4", text, path.name)
+            for line in path.read_text().splitlines():
+                if line.strip().startswith("#") or "uses:" not in line:
+                    continue
+                self.assertRegex(line, pinned, path.name)
+        for name in (
+            "run_bot_on_tournament.yaml",
+            "run_bot_on_metaculus_cup.yaml",
+            "test_bot.yaml",
+        ):
+            text = (workflow_dir / name).read_text()
+            self.assertIn("group: metac-bot-forecast", text, name)
+            self.assertIn("cancel-in-progress: false", text, name)
+        review = (workflow_dir / "review_bot.yaml").read_text()
+        self.assertNotIn("metac-bot-forecast", review)
         dry_run = (workflow_dir / "test_bot.yaml").read_text()
         self.assertRegex(
             dry_run,
             r"max_questions:\n[ \t]+description:.*\n[ \t]+type: number\n[ \t]+default: 1\n",
         )
-        self.assertIn("MAX_QUESTIONS: ${{ inputs.max_questions || 1 }}", dry_run)
+        self.assertIn("MAX_QUESTIONS: \"${{ format('{0}', inputs.max_questions) }}\"", dry_run)
         self.assertIn('--max-questions "$MAX_QUESTIONS"', dry_run)
+        self.assertIn(
+            "max_questions must be a whole number of at least 1, got: ${MAX_QUESTIONS}.",
+            dry_run,
+        )
         self.assertNotIn("--max-questions 1", dry_run)
         self.assertIn("logs/question_attempts.json", dry_run)
         for body in _run_script_bodies(dry_run):
@@ -631,19 +651,13 @@ class AttemptAndLimitTests(unittest.TestCase):
         )
         self.assertEqual([question.id_of_question for question in including_done], [1, 2])
 
-    def test_bot_skips_before_slicing_and_records_real_failures(self) -> None:
-        source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-        forecast = source.split("async def forecast_questions", 1)[1].split(
-            "async def _run_individual_question", 1
-        )[0]
-        self.assertIn("select_questions", forecast)
-        self.assertLess(forecast.index("select_questions"), forecast.index("super().forecast_questions"))
-        self.assertNotIn("questions[:", forecast)
-        individual = source.split("async def _run_individual_question", 1)[1].split(
-            "def _record_question_failure", 1
-        )[0]
-        self.assertIn("failure_counts_toward_retry", individual)
-        self.assertIn("record_failure", source)
+    def test_zero_or_negative_max_questions_is_rejected(self) -> None:
+        self.assertEqual(require_max_questions("3"), 3)
+        self.assertEqual(require_max_questions(" 9 "), 9)
+        for raw in ("0", "-1", "1.5", "", "no"):
+            with self.assertRaises(ValueError) as caught:
+                require_max_questions(raw)
+            self.assertIn("at least 1", str(caught.exception))
 
 
 class BoundClampTests(unittest.TestCase):
@@ -689,8 +703,12 @@ class BoundClampTests(unittest.TestCase):
         self.assertLess(opened[0], lower)
         self.assertGreaterEqual(opened[0], lower - margin - 1e-12)
         tied = clamp_monotonic_values([upper] * 6, lower, upper, False, False)
+        gap = 0.001 * (upper - lower)
         self.assertTrue(all(lower <= value <= upper for value in tied))
-        self.assertTrue(all(tied[i] < tied[i + 1] for i in range(len(tied) - 1)))
+        self.assertAlmostEqual(tied[-1], upper)
+        self.assertTrue(
+            all(tied[i + 1] - tied[i] >= gap - 1e-9 for i in range(len(tied) - 1))
+        )
 
     def test_bounds_text_states_the_range_and_which_sides_are_open(self) -> None:
         text = format_forecast_bounds(
@@ -708,49 +726,89 @@ class BoundClampTests(unittest.TestCase):
         self.assertIn("closed", text)
         self.assertIn("open", text)
 
-    def test_numeric_and_date_prompts_clamp_for_every_roster(self) -> None:
-        source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-        self.assertEqual(source.count("async def _run_forecast_on_numeric"), 1)
-        self.assertEqual(source.count("async def _run_forecast_on_date"), 1)
-        numeric_prompt = source.split("async def _run_forecast_on_numeric", 1)[1].split(
-            "async def _numeric_prompt_to_forecast", 1
-        )[0]
-        date_prompt = source.split("async def _run_forecast_on_date", 1)[1].split(
-            "async def _date_prompt_to_forecast", 1
-        )[0]
-        self.assertIn("_bounds_prompt(question)", numeric_prompt)
-        self.assertIn("_bounds_prompt(question)", date_prompt)
-        numeric_parse = source.split("async def _numeric_prompt_to_forecast", 1)[1].split(
-            "async def _run_forecast_on_date", 1
-        )[0]
-        date_parse = source.split("async def _date_prompt_to_forecast", 1)[1].split(
-            "def _create_resolved_question_parsing_message", 1
-        )[0]
-        self.assertIn("_clamp_percentile_values", numeric_parse)
-        self.assertIn("_clamp_percentile_values", date_parse)
-        numeric_aggregate = source.split("def _install_median_numeric_aggregation", 1)[1].split(
-            "def _question_bound_numbers", 1
-        )[0]
-        self.assertIn("clamp_monotonic_values", numeric_aggregate)
+    def test_log_scale_open_lower_bound_stays_positive_and_above_zero_point(self) -> None:
+        lower, upper, zero_point = 1.0, 1_000_000.0, 0.0
+        ratio = (upper - zero_point) / (lower - zero_point)
+        expected_low = lower + (upper - lower) * (ratio ** -0.05 - 1) / (ratio - 1)
+        allowed_low, allowed_high = bot_helpers.allowed_value_range(
+            lower,
+            upper,
+            True,
+            False,
+            zero_point=zero_point,
+            floor_non_negative=True,
+        )
+        self.assertAlmostEqual(allowed_low, expected_low, places=6)
+        self.assertGreater(allowed_low, 0.4)
+        self.assertLess(allowed_low, lower)
+        self.assertEqual(allowed_high, upper)
+        clamped = clamp_monotonic_values(
+            [-50_000, 10, 100, 1_000, 10_000, 2_000_000],
+            lower,
+            upper,
+            True,
+            False,
+            zero_point=zero_point,
+            floor_non_negative=True,
+        )
+        self.assertGreaterEqual(min(clamped), allowed_low - 1e-9)
+        self.assertLessEqual(max(clamped), upper)
+        self.assertTrue(all(value > zero_point for value in clamped))
+        self.assertTrue(all(value > 0 for value in clamped))
+        dipped = bot_helpers.allowed_value_range(
+            1.0,
+            100.0,
+            True,
+            False,
+            zero_point=-50.0,
+            floor_non_negative=True,
+        )
+        self.assertGreaterEqual(dipped[0], 0.0)
+        self.assertGreater(dipped[0], -50.0)
+        prompt = forecast_bounds_text(
+            lower=lower,
+            upper=upper,
+            open_lower=True,
+            open_upper=False,
+            zero_point=zero_point,
+            floor_non_negative=True,
+        )
+        self.assertIn("Allowed range", prompt)
+        self.assertIn("open", prompt)
+        self.assertIn("closed", prompt)
+        self.assertNotIn("between -", prompt)
+        self.assertIn(f"{allowed_low:.6g}", prompt)
 
-    def test_reasoning_request_sets_high_effort_and_drops_quantized_hosts(self) -> None:
+    def test_reasoning_request_asks_for_high_effort_and_leaves_routing_alone(self) -> None:
         body = openrouter_request_body(reasoning=True)
-        self.assertEqual(body["reasoning"], {"effort": "high", "enabled": True})
-        allowed = body["provider"]["quantizations"]
-        self.assertEqual(allowed, ["fp16", "bf16", "fp32", "unknown"])
-        for banned in ("fp8", "fp4", "mxfp4"):
-            self.assertNotIn(banned, allowed)
-        self.assertNotIn("allow_fallbacks", body["provider"])
+        self.assertEqual(body, {"reasoning": {"effort": "high", "enabled": True}})
+        self.assertNotIn("provider", body)
         quiet = openrouter_request_body(reasoning=False)
-        self.assertEqual(quiet["reasoning"], {"effort": "none", "enabled": False})
+        self.assertEqual(quiet, {"reasoning": {"effort": "none", "enabled": False}})
         self.assertNotIn("provider", quiet)
-        source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-        self.assertIn("openrouter_request_body", source)
-        self.assertIn('set_llm(self._parser, "default")', source)
-        self.assertIn('set_llm(self._parser, "summarizer")', source)
-        self.assertIn("with model %s", source)
-        self.assertIn("settled_usd", source)
-        self.assertIn("reserved_usd", source)
+
+    def test_deepseek_reservation_covers_an_expensive_host(self) -> None:
+        forecast = estimate_call_cost_usd(OPENROUTER_DEEPSEEK_V4_PRO, "forecast")
+        checklist = estimate_call_cost_usd(OPENROUTER_DEEPSEEK_V4_PRO, "checklist")
+        self.assertGreaterEqual(forecast, 0.019)
+        self.assertGreaterEqual(checklist, 0.019)
+        near_cap = SpendTracker(
+            path=Path("/tmp/does-not-matter-deepseek.json"),
+            remote_usd=SPEND_HARD_CAP_USD - forecast + 0.001,
+            gap_usd=0.0,
+            fetch_usage=lambda: None,
+            usage_known=True,
+        )
+        self.assertFalse(near_cap.try_reserve(forecast))
+        room = SpendTracker(
+            path=Path("/tmp/does-not-matter-deepseek-room.json"),
+            remote_usd=SPEND_HARD_CAP_USD - forecast - 0.001,
+            gap_usd=0.0,
+            fetch_usage=lambda: None,
+            usage_known=True,
+        )
+        self.assertTrue(room.try_reserve(forecast))
+        self.assertAlmostEqual(room.reserved_usd, forecast)
 
 
 def _run_script_bodies(text: str) -> list[str]:

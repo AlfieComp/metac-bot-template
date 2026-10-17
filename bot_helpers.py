@@ -215,13 +215,16 @@ PROBABILITY_CAP = 0.99
 # Used when LiteLLM reports no dollar cost, and reserved before the call starts.
 # Gemini's figure covers a full high-reasoning completion (about 6k input
 # tokens and 16k output tokens at the published OpenRouter rates).
+# DeepSeek V4 Pro can be routed to an expensive host (about $1.04 per million
+# input tokens and $2.09 per million output tokens). Six thousand of each is
+# about $0.019, so the reservation stays above that.
 _ESTIMATED_CALL_USD = {
     # Forecaster figures are the call itself. The parser is metered separately.
     "gemini-forecast": 0.070,
     "kimi-forecast": 0.080,
-    "deepseek-pro-forecast": 0.008,
+    "deepseek-pro-forecast": 0.020,
     "gemini-checklist": 0.070,
-    "deepseek-checklist": 0.008,
+    "deepseek-checklist": 0.020,
     "parser": 0.003,
 }
 
@@ -745,19 +748,26 @@ DEFAULT_ATTEMPT_LEDGER = Path("logs/question_attempts.json")
 
 # Open bounds may sit slightly outside the stated bound. Closed bounds may not.
 OPEN_BOUND_MARGIN = 0.05
-# Reasoning calls avoid the fp8/fp4 hosts seen on the dry run. "unknown" stays
-# allowed because several full-precision hosts do not publish a quantization.
-_REASONING_QUANTIZATIONS = ("fp16", "bf16", "fp32", "unknown")
+# When several percentiles sit on a bound, keep them this far apart in the
+# question's scaled range so the posted CDF is not a vertical spike.
+MIN_BOUND_GAP_FRACTION = 1e-3
 
 
 def openrouter_request_body(*, reasoning: bool) -> dict[str, Any]:
-    """Body sent to OpenRouter. Reasoning calls ask for high effort explicitly."""
-    if not reasoning:
-        return {"reasoning": {"effort": "none", "enabled": False}}
-    return {
-        "reasoning": {"effort": "high", "enabled": True},
-        "provider": {"quantizations": list(_REASONING_QUANTIZATIONS)},
-    }
+    """Reasoning effort only. OpenRouter chooses the host and may fall back."""
+    if reasoning:
+        return {"reasoning": {"effort": "high", "enabled": True}}
+    return {"reasoning": {"effort": "none", "enabled": False}}
+
+
+def require_max_questions(raw: str) -> int:
+    """Accept a positive whole number. Zero and anything smaller are errors."""
+    text = str(raw).strip()
+    if not re.fullmatch(r"[1-9][0-9]*", text):
+        raise ValueError(
+            f"max_questions must be a whole number of at least 1, got {raw!r}."
+        )
+    return int(text)
 
 
 def question_attempt_key(question: Any) -> str:
@@ -914,6 +924,8 @@ def allowed_value_range(
     open_lower: bool,
     open_upper: bool,
     margin_fraction: float = OPEN_BOUND_MARGIN,
+    zero_point: float | None = None,
+    floor_non_negative: bool = False,
 ) -> tuple[float, float]:
     """Inclusive interval a percentile is allowed to occupy."""
     low_bound = float(lower)
@@ -926,10 +938,23 @@ def allowed_value_range(
         raise ValueError(
             "Question bounds must be finite and the upper bound must be greater than the lower bound"
         )
-    span = high_bound - low_bound
-    margin = span * margin_fraction
-    low = low_bound - margin if open_lower else low_bound
-    high = high_bound + margin if open_upper else high_bound
+    zero = None if zero_point is None else float(zero_point)
+    if zero is not None and (not math.isfinite(zero) or low_bound <= zero):
+        raise ValueError("A log-scale lower bound must be above the zero point")
+    low_location = -margin_fraction if open_lower else 0.0
+    high_location = 1.0 + margin_fraction if open_upper else 1.0
+    low = _location_to_value(low_bound, high_bound, zero, low_location)
+    high = _location_to_value(low_bound, high_bound, zero, high_location)
+    floor = zero
+    if floor_non_negative:
+        floor = 0.0 if floor is None else max(floor, 0.0)
+    if floor is not None:
+        clearance = 0.0
+        if zero is not None and floor <= zero:
+            clearance = max((low_bound - zero) * 1e-9, 1e-15)
+        low = max(low, floor + clearance)
+    if not math.isfinite(low) or not math.isfinite(high) or high <= low:
+        raise ValueError("Allowed range has no width")
     return low, high
 
 
@@ -940,12 +965,22 @@ def clamp_monotonic_values(
     open_lower: bool,
     open_upper: bool,
     margin_fraction: float = OPEN_BOUND_MARGIN,
+    zero_point: float | None = None,
+    floor_non_negative: bool = False,
 ) -> list[float]:
     """Pull percentile values into the allowed range and keep them strictly increasing."""
     if not values:
         raise ValueError("No percentile values to clamp")
+    low_bound = float(lower)
+    high_bound = float(upper)
     low, high = allowed_value_range(
-        lower, upper, open_lower, open_upper, margin_fraction
+        low_bound,
+        high_bound,
+        open_lower,
+        open_upper,
+        margin_fraction,
+        zero_point=zero_point,
+        floor_non_negative=floor_non_negative,
     )
     clamped: list[float] = []
     for value in values:
@@ -953,36 +988,107 @@ def clamp_monotonic_values(
         if not math.isfinite(numeric):
             raise ValueError("Percentile value is not a finite number")
         clamped.append(min(high, max(low, numeric)))
-    return _strictly_increasing_inside(clamped, low, high)
+    return _separate_bound_pileup(
+        clamped,
+        low,
+        high,
+        low_bound,
+        high_bound,
+        None if zero_point is None else float(zero_point),
+    )
 
 
-def _strictly_increasing_inside(
-    values: list[float], low: float, high: float
+def _location_to_value(
+    lower: float, upper: float, zero_point: float | None, location: float
+) -> float:
+    if zero_point is None:
+        return lower + (upper - lower) * location
+    ratio = (upper - zero_point) / (lower - zero_point)
+    if ratio <= 0 or ratio == 1:
+        raise ValueError("Log-scale bounds are not usable")
+    return lower + (upper - lower) * (ratio**location - 1) / (ratio - 1)
+
+
+def _value_to_location(
+    lower: float, upper: float, zero_point: float | None, value: float
+) -> float:
+    if zero_point is None:
+        return (value - lower) / (upper - lower)
+    ratio = (upper - zero_point) / (lower - zero_point)
+    scaled = (value - lower) / (upper - lower) * (ratio - 1) + 1
+    if scaled <= 0 or ratio <= 0 or ratio == 1:
+        return -1e9
+    return math.log(scaled) / math.log(ratio)
+
+
+def _separate_bound_pileup(
+    values: list[float],
+    low: float,
+    high: float,
+    lower: float,
+    upper: float,
+    zero_point: float | None,
 ) -> list[float]:
+    """Keep a real gap when percentiles stack on an open or closed bound."""
     count = len(values)
-    if count == 1:
-        return [min(high, max(low, values[0]))]
-    span = high - low
-    if span <= 0:
+    locations = [
+        _value_to_location(lower, upper, zero_point, value) for value in values
+    ]
+    loc_low = _value_to_location(lower, upper, zero_point, low)
+    loc_high = _value_to_location(lower, upper, zero_point, high)
+    if loc_high <= loc_low:
         raise ValueError("Allowed range has no width")
-    min_step = max(span / (count - 1) / 1_000_000, span * 1e-12)
-    result = list(values)
+    locations = [min(loc_high, max(loc_low, location)) for location in locations]
+    if count == 1:
+        return [_location_to_value(lower, upper, zero_point, locations[0])]
+    tiny = max((loc_high - loc_low) * 1e-12, 1e-15)
     for index in range(1, count):
-        if result[index] <= result[index - 1]:
-            result[index] = result[index - 1] + min_step
-    if result[-1] > high or result[0] < low:
-        result[-1] = min(result[-1], high)
+        if locations[index] <= locations[index - 1]:
+            locations[index] = locations[index - 1] + tiny
+    if locations[-1] > loc_high or locations[0] < loc_low:
+        locations[-1] = min(locations[-1], loc_high)
         for index in range(count - 2, -1, -1):
-            if result[index] >= result[index + 1]:
-                result[index] = result[index + 1] - min_step
+            if locations[index] >= locations[index + 1]:
+                locations[index] = locations[index + 1] - tiny
+    _spread_edge_cluster(locations, loc_high, MIN_BOUND_GAP_FRACTION, from_high=True)
+    _spread_edge_cluster(locations, loc_low, MIN_BOUND_GAP_FRACTION, from_high=False)
     if (
-        result[0] < low
-        or result[-1] > high
-        or any(result[index] <= result[index - 1] for index in range(1, count))
+        locations[0] < loc_low - 1e-12
+        or locations[-1] > loc_high + 1e-12
+        or any(locations[index] <= locations[index - 1] for index in range(1, count))
     ):
-        step = span / (count - 1)
-        result = [low + step * index for index in range(count)]
-    return result
+        step = (loc_high - loc_low) / (count - 1)
+        locations = [loc_low + step * index for index in range(count)]
+    converted = [
+        min(high, max(low, _location_to_value(lower, upper, zero_point, location)))
+        for location in locations
+    ]
+    for index in range(1, count):
+        if converted[index] <= converted[index - 1]:
+            converted[index] = min(high, converted[index - 1] + max(tiny, 1e-15))
+    return converted
+
+
+def _spread_edge_cluster(
+    locations: list[float], edge: float, min_step: float, *, from_high: bool
+) -> None:
+    count = len(locations)
+    if from_high:
+        if locations[-1] < edge - min_step:
+            return
+        start = count - 1
+        while start > 0 and locations[start] - locations[start - 1] < min_step:
+            start -= 1
+        for offset, index in enumerate(range(count - 1, start - 1, -1)):
+            locations[index] = edge - offset * min_step
+        return
+    if locations[0] > edge + min_step:
+        return
+    end = 0
+    while end < count - 1 and locations[end + 1] - locations[end] < min_step:
+        end += 1
+    for offset, index in enumerate(range(end + 1)):
+        locations[index] = edge + offset * min_step
 
 
 def format_forecast_bounds(
@@ -1003,6 +1109,36 @@ def format_forecast_bounds(
         f"The question upper bound is {upper} and it is {upper_kind}. "
         "A closed bound is a hard limit. An open bound allows only the small margin already included in the allowed range. "
         "Do not write any percentile outside that allowed range. Keep the values strictly increasing."
+    )
+
+
+def forecast_bounds_text(
+    *,
+    lower: float,
+    upper: float,
+    open_lower: bool,
+    open_upper: bool,
+    zero_point: float | None = None,
+    floor_non_negative: bool = False,
+    unit: str = "",
+) -> str:
+    """Prompt sentence for a numeric question, including a log-scale margin."""
+    allowed_low, allowed_high = allowed_value_range(
+        lower,
+        upper,
+        open_lower,
+        open_upper,
+        zero_point=zero_point,
+        floor_non_negative=floor_non_negative,
+    )
+    suffix = f" {unit}" if unit else ""
+    return format_forecast_bounds(
+        lower=f"{lower:.6g}{suffix}",
+        upper=f"{upper:.6g}{suffix}",
+        allowed_low=f"{allowed_low:.6g}{suffix}",
+        allowed_high=f"{allowed_high:.6g}{suffix}",
+        open_lower=open_lower,
+        open_upper=open_upper,
     )
 
 
