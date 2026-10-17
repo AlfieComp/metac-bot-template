@@ -463,6 +463,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("schedule:", active)
         self.assertFalse(any(line.startswith("cron:") or "- cron:" in line for line in active))
 
+    def test_cup_schedule_is_manual_until_a_dry_run(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / ".github"
+            / "workflows"
+            / "run_bot_on_metaculus_cup.yaml"
+        )
+        active = [
+            line.strip()
+            for line in path.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertIn("workflow_dispatch:", active)
+        self.assertNotIn("schedule:", active)
+        self.assertFalse(any(line.startswith("cron:") or "- cron:" in line for line in active))
+
 
 if __name__ == "__main__":
     unittest.main()

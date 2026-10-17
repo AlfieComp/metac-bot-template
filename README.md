@@ -74,7 +74,7 @@ Instructions for getting your METACULUS_TOKEN, OPENROUTER_API_KEY, or optional s
 To run a different script under the same workflows, edit the `poetry run python main.py` line in the appropriate file under `.github/workflows/` and replace `main.py` with your script. The workflows that exist:
 - `test_bot.yaml` — unit tests on every pull request. An optional manual dry run forecasts one bot-testing-area question and does not submit it.
 - `run_bot_on_tournament.yaml` — manual run on the live AIB tournament + MiniBench. The 20-minute schedule is off until a live dry run has been checked.
-- `run_bot_on_metaculus_cup.yaml` — every 2 days on the Metaculus Cup.
+- `run_bot_on_metaculus_cup.yaml` — manual run on the Metaculus Cup. The every-other-day schedule is off until a live dry run has been checked.
 
 **To run `main_with_no_framework.py` via GitHub Actions instead of `main.py`:** open the workflow file you want and change `poetry run python main.py` to `poetry run python main_with_no_framework.py`. That's the only change required.
 

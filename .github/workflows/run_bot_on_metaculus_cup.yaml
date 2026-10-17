@@ -5,8 +5,10 @@ permissions:
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 */2 * *" # runs at midnight every 2 days
+  # The every-other-day schedule stays off until a live dry run has been checked.
+  # Nothing on this workflow submits until someone runs it by hand.
+  # schedule:
+  #   - cron: "0 0 */2 * *" # runs at midnight every 2 days
 
 # Add concurrency group to prevent parallel runs
 concurrency:
