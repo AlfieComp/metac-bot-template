@@ -479,6 +479,70 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("schedule:", active)
         self.assertFalse(any(line.startswith("cron:") or "- cron:" in line for line in active))
 
+    def test_manual_forecast_defaults_to_dry_run(self) -> None:
+        workflow_dir = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+        for name in ("run_bot_on_tournament.yaml", "run_bot_on_metaculus_cup.yaml"):
+            text = (workflow_dir / name).read_text()
+            self.assertRegex(
+                text,
+                r"dry_run:\n[ \t]+description:.*\n[ \t]+type: boolean\n[ \t]+default: true\n",
+            )
+            self.assertRegex(
+                text,
+                r"max_questions:\n[ \t]+description:.*\n[ \t]+type: number\n[ \t]+default: 3\n",
+            )
+            self.assertIn(
+                "DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}",
+                text,
+                name,
+            )
+            self.assertIn(
+                "MAX_QUESTIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_questions || '' }}",
+                text,
+                name,
+            )
+            bodies = _run_script_bodies(text)
+            self.assertTrue(bodies, name)
+            for body in bodies:
+                self.assertNotIn("${{", body, name)
+            joined = "\n".join(bodies)
+            self.assertIn('if [ "$DRY_RUN" = "true" ]; then', joined)
+            self.assertIn("args+=(--dry-run)", joined)
+            self.assertIn('args+=(--max-questions "$MAX_QUESTIONS")', joined)
+            active = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            self.assertNotIn("schedule:", active, name)
+            self.assertFalse(any(line.startswith("cron:") or "- cron:" in line for line in active))
+
+
+def _run_script_bodies(text: str) -> list[str]:
+    lines = text.splitlines()
+    bodies: list[str] = []
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].lstrip()
+        indent = len(lines[index]) - len(stripped)
+        if stripped != "run: |":
+            index += 1
+            continue
+        index += 1
+        body: list[str] = []
+        while index < len(lines):
+            if lines[index].strip() == "":
+                body.append(lines[index])
+                index += 1
+                continue
+            next_indent = len(lines[index]) - len(lines[index].lstrip())
+            if next_indent <= indent:
+                break
+            body.append(lines[index])
+            index += 1
+        bodies.append("\n".join(body))
+    return bodies
+
 
 if __name__ == "__main__":
     unittest.main()
