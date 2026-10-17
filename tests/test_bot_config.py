@@ -437,6 +437,32 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn('{"remote_usd": 0.0, "gap_usd": 0.0}', text, path.name)
             self.assertNotIn("Keep a spend ledger", text, path.name)
 
+    def test_review_package_is_pinned_and_stays_off(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        pyproject = (root / "pyproject.toml").read_text()
+        self.assertIn('metaculus-bot-review = "==0.1.2"', pyproject)
+        review = (root / ".github" / "workflows" / "review_bot.yaml").read_text()
+        self.assertIn("REVIEW_BOT_ENABLED == 'true'", review)
+        self.assertIn('REVIEW_DAYS: ${{ inputs.days || \'30\' }}', review)
+        self.assertIn('--resolved-since "$REVIEW_DAYS"', review)
+        self.assertNotIn("--resolved-since ${{", review)
+
+    def test_tournament_schedule_is_manual_until_a_dry_run(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / ".github"
+            / "workflows"
+            / "run_bot_on_tournament.yaml"
+        )
+        active = [
+            line.strip()
+            for line in path.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertIn("workflow_dispatch:", active)
+        self.assertNotIn("schedule:", active)
+        self.assertFalse(any(line.startswith("cron:") or "- cron:" in line for line in active))
+
 
 if __name__ == "__main__":
     unittest.main()

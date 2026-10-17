@@ -42,11 +42,12 @@ jobs:
       - name: Review forecasts
         run: |
           poetry run bot-review review \
-            --resolved-since ${{ inputs.days || 30 }} \
+            --resolved-since "$REVIEW_DAYS" \
             --output review.json \
             --summary review.md
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          REVIEW_DAYS: ${{ inputs.days || '30' }}
       - name: Show the summary in the run page
         run: cat review.md >> $GITHUB_STEP_SUMMARY
       - name: Keep the review
