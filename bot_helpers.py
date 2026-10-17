@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import statistics
 import sys
+import threading
 import warnings
 from pathlib import Path
 from typing import Any, Sequence
@@ -209,17 +211,24 @@ SPEND_GAP_CAP_USD = 0.12
 PROBABILITY_FLOOR = 0.01
 PROBABILITY_CAP = 0.99
 
-# Used only when LiteLLM reports no dollar cost for a call. High enough that
-# a silent cost tracker still trips the switch before the hard cap.
+# Used when LiteLLM reports no dollar cost, and reserved before the call starts.
+# Gemini's figure covers a full high-reasoning completion (about 6k input
+# tokens and 16k output tokens at the published OpenRouter rates).
 _ESTIMATED_CALL_USD = {
     # Forecaster figures are the call itself. The parser is metered separately.
-    "gemini-forecast": 0.020,
+    "gemini-forecast": 0.070,
     "kimi-forecast": 0.080,
     "deepseek-pro-forecast": 0.008,
-    "gemini-checklist": 0.020,
+    "gemini-checklist": 0.070,
     "deepseek-checklist": 0.008,
     "parser": 0.003,
 }
+
+# Submit a question only when at least this many forecasts succeeded.
+MIN_SUCCESSFUL_FORECASTS = 3
+# Heights used to take a median distribution for numeric and date questions.
+PERCENTILE_HEIGHTS = (0.1, 0.2, 0.4, 0.6, 0.8, 0.9)
+GEMINI_MAX_TOKENS = 16000
 
 DEFAULT_SPEND_LEDGER = Path("logs/openrouter_spend.json")
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
@@ -250,9 +259,11 @@ _MARKET_ODDS = re.compile(
     re.IGNORECASE,
 )
 _HAS_PROBABILITY = re.compile(
-    r"\b\d{1,3}(?:\.\d+)?\s*%|\b0\.\d+\b|\bodds\b|\bprobability\b",
+    r"\b\d{1,3}(?:\.\d+)?\s*(?:%|percent\b)|\b0\.\d+\b|\bodds\b|\bprobability\b",
     re.IGNORECASE,
 )
+_ODDS_OF = re.compile(r"\bodds\s+of\b", re.IGNORECASE)
+_MARKET_PRICE = re.compile(r"\bmarket\s+prices?\b", re.IGNORECASE)
 
 
 class SpendCapReached(RuntimeError):
@@ -279,6 +290,21 @@ def use_deepseek_only(spend_usd: float) -> bool:
 
 def over_hard_cap(spend_usd: float) -> bool:
     return spend_usd >= SPEND_HARD_CAP_USD
+
+
+def required_success_fraction(forecasts_per_question: int = 5) -> float:
+    """Fraction of forecasts that must succeed before a question is submitted."""
+    count = max(int(forecasts_per_question), 1)
+    return min(1.0, MIN_SUCCESSFUL_FORECASTS / count)
+
+
+def recorded_call_cost_usd(measured: float, estimate: float, succeeded: bool) -> float:
+    """Count a failed or unpriced call at the conservative estimate, not at $0."""
+    measured_usd = max(0.0, float(measured))
+    estimate_usd = max(0.0, float(estimate))
+    if succeeded and measured_usd > 0:
+        return measured_usd
+    return max(measured_usd, estimate_usd)
 
 
 def call_would_pass_hard_cap(spend_usd: float, next_estimate_usd: float) -> bool:
@@ -356,6 +382,64 @@ def median_binary(probabilities: list[float]) -> float:
     return clip_probability(float(statistics.median(probabilities)))
 
 
+def _interpolate(target: float, xs: Sequence[float], ys: Sequence[float]) -> float:
+    if target <= xs[0]:
+        return float(ys[0])
+    if target >= xs[-1]:
+        return float(ys[-1])
+    for index in range(1, len(xs)):
+        if target <= xs[index]:
+            span = xs[index] - xs[index - 1]
+            if span == 0:
+                return float(ys[index])
+            weight = (target - xs[index - 1]) / span
+            return float(ys[index - 1] + weight * (ys[index] - ys[index - 1]))
+    return float(ys[-1])
+
+
+def _strictly_increasing(values: list[float]) -> list[float]:
+    result = [float(value) for value in values]
+    span = max(result) - min(result)
+    step = max(abs(span) * 1e-9, 1e-9)
+    for index in range(1, len(result)):
+        if result[index] <= result[index - 1]:
+            result[index] = result[index - 1] + step
+    return result
+
+
+def median_percentile_values(
+    forecasts: Sequence[Sequence[tuple[float, float]]],
+    heights: Sequence[float] = PERCENTILE_HEIGHTS,
+) -> list[tuple[float, float]]:
+    """Median outcome value at each percentile height.
+
+    Each forecast is a list of (percentile, value) points. Values at the shared
+    heights are interpolated, then the median value is taken at each height.
+    Tied values are nudged so the result is strictly increasing.
+    """
+    if not forecasts:
+        raise ValueError("Cannot aggregate an empty list of numeric forecasts")
+    targets = [float(height) for height in heights]
+    if len(targets) < 2:
+        raise ValueError("Need at least two percentile heights")
+    medians: list[float] = []
+    for height in targets:
+        column: list[float] = []
+        for forecast in forecasts:
+            if len(forecast) < 2:
+                raise ValueError("Each numeric forecast needs at least two points")
+            points = sorted(forecast, key=lambda item: item[0])
+            column.append(
+                _interpolate(
+                    height,
+                    [point[0] for point in points],
+                    [point[1] for point in points],
+                )
+            )
+        medians.append(float(statistics.median(column)))
+    return list(zip(targets, _strictly_increasing(medians)))
+
+
 def median_option_probabilities(
     forecasts: list[dict[str, float]],
 ) -> dict[str, float]:
@@ -405,6 +489,8 @@ def resolution_checklist_prompt(
 
 def _line_states_crowd_or_market_odds(line: str) -> bool:
     if _CROWD_MENTION.search(line):
+        return True
+    if _ODDS_OF.search(line) or _MARKET_PRICE.search(line):
         return True
     return bool(_MARKET_ODDS.search(line) and _HAS_PROBABILITY.search(line))
 
@@ -468,7 +554,7 @@ def fetch_openrouter_usage_usd() -> float | None:
         payload = response.json()
     except Exception as exc:
         logging.getLogger(__name__).warning(
-            "Could not read OpenRouter usage (%s). Using the local spend ledger.",
+            "Could not read OpenRouter usage (%s). Forecasting continues only when a saved spend record exists.",
             type(exc).__name__,
         )
         return None
@@ -482,14 +568,30 @@ def fetch_openrouter_usage_usd() -> float | None:
         return None
 
 
+def _trusted_ledger_amounts(raw: Any) -> tuple[float, float] | None:
+    """A ledger counts only when it was written after a real usage reading."""
+    if not isinstance(raw, dict) or raw.get("usage_known") is not True:
+        return None
+    try:
+        remote_usd = float(raw["remote_usd"])
+        gap_usd = float(raw["gap_usd"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(remote_usd) or not math.isfinite(gap_usd):
+        return None
+    if remote_usd < 0 or gap_usd < 0:
+        return None
+    return remote_usd, gap_usd
+
+
 class SpendTracker:
     """
     Track OpenRouter spend across GitHub Actions runs.
 
-    `remote_usd` is the last usage figure from OpenRouter (or the ledger).
-    `gap_usd` is spend measured since that reading. When a newer reading
-    arrives, the gap shrinks to whatever the reading has not absorbed yet,
-    and is capped so a high estimate cannot stick around forever.
+    `remote_usd` is the last usage figure from OpenRouter (or a trusted ledger).
+    `gap_usd` is settled spend since that reading. `reserved_usd` is budget held
+    for calls that have started and not finished; it is memory only.
+    Forecasting is refused until a usage reading or a trusted ledger exists.
     """
 
     def __init__(
@@ -498,10 +600,14 @@ class SpendTracker:
         remote_usd: float = 0.0,
         gap_usd: float = 0.0,
         fetch_usage: Any = None,
+        usage_known: bool = False,
     ) -> None:
         self.path = path or DEFAULT_SPEND_LEDGER
         self.remote_usd = max(0.0, float(remote_usd))
         self.gap_usd = max(0.0, float(gap_usd))
+        self.reserved_usd = 0.0
+        self.usage_known = bool(usage_known)
+        self._lock = threading.Lock()
         self._fetch_usage = fetch_usage if fetch_usage is not None else fetch_openrouter_usage_usd
 
     @classmethod
@@ -513,23 +619,29 @@ class SpendTracker:
         ledger_path = path or DEFAULT_SPEND_LEDGER
         remote_usd = 0.0
         gap_usd = 0.0
+        usage_known = False
         if ledger_path.is_file():
             try:
-                raw = json.loads(ledger_path.read_text())
-                remote_usd = float(raw.get("remote_usd", 0.0))
-                gap_usd = float(raw.get("gap_usd", 0.0))
+                trusted = _trusted_ledger_amounts(json.loads(ledger_path.read_text()))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                remote_usd = 0.0
-                gap_usd = 0.0
+                trusted = None
+            if trusted is not None:
+                remote_usd, gap_usd = trusted
+                usage_known = True
         return cls(
             path=ledger_path,
             remote_usd=remote_usd,
             gap_usd=gap_usd,
             fetch_usage=fetch_usage,
+            usage_known=usage_known,
         )
 
     def effective_usd(self) -> float:
-        return self.remote_usd + self.gap_usd
+        return self.remote_usd + self.gap_usd + self.reserved_usd
+
+    def can_forecast(self) -> bool:
+        """True when spend is known. The hard cap is checked separately."""
+        return self.usage_known
 
     def deepseek_only(self) -> bool:
         return use_deepseek_only(self.effective_usd())
@@ -538,41 +650,81 @@ class SpendTracker:
         return over_hard_cap(self.effective_usd())
 
     def would_exceed_cap(self, next_estimate_usd: float) -> bool:
+        if not self.usage_known:
+            return True
         return self.over_hard_cap() or call_would_pass_hard_cap(
             self.effective_usd(), next_estimate_usd
         )
 
+    def try_reserve(self, amount_usd: float) -> bool:
+        """Hold budget before a call starts. False when usage is unknown or the hold would pass the cap."""
+        amount = max(0.0, float(amount_usd))
+        with self._lock:
+            if not self.usage_known:
+                return False
+            if self.over_hard_cap() or call_would_pass_hard_cap(self.effective_usd(), amount):
+                return False
+            self.reserved_usd += amount
+            return True
+
+    def settle_reservation(self, reserved_usd: float, actual_usd: float) -> None:
+        """Replace a hold with the cost that should stick after the call."""
+        with self._lock:
+            self.reserved_usd = max(0.0, self.reserved_usd - max(0.0, float(reserved_usd)))
+            actual = max(0.0, float(actual_usd))
+            if actual > 0:
+                self.gap_usd += actual
+            self.save()
+
     def add_unconfirmed(self, amount_usd: float) -> None:
         if amount_usd <= 0:
             return
-        self.gap_usd += float(amount_usd)
-        self.save()
+        with self._lock:
+            self.gap_usd += float(amount_usd)
+            self.save()
 
     def refresh(self) -> None:
         usage = self._fetch_usage()
         if usage is None:
             return
-        usage = max(0.0, float(usage))
-        if usage + 1e-9 < self.remote_usd:
-            # A lower reading is a different key or a stale response. Keep the ledger.
-            self.save()
+        try:
+            usage_usd = float(usage)
+        except (TypeError, ValueError):
             return
-        if usage > self.remote_usd + 1e-9:
-            projected = self.remote_usd + self.gap_usd
-            remainder = max(0.0, projected - usage)
-            self.remote_usd = usage
-            self.gap_usd = min(remainder, SPEND_GAP_CAP_USD)
-        self.save()
+        if not math.isfinite(usage_usd) or usage_usd < 0:
+            return
+        with self._lock:
+            if not self.usage_known:
+                self.remote_usd = usage_usd
+                self.gap_usd = 0.0
+                self.usage_known = True
+                self.save()
+                return
+            if usage_usd + 1e-9 < self.remote_usd:
+                # A lower reading is a different key or a stale response. Keep the ledger.
+                self.save()
+                return
+            if usage_usd > self.remote_usd + 1e-9:
+                projected = self.remote_usd + self.gap_usd
+                remainder = max(0.0, projected - usage_usd)
+                self.remote_usd = usage_usd
+                self.gap_usd = min(remainder, SPEND_GAP_CAP_USD)
+            self.save()
 
     def save(self) -> None:
+        if not self.usage_known:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "remote_usd": round(self.remote_usd, 6),
             "gap_usd": round(self.gap_usd, 6),
+            "usage_known": True,
         }
         self.path.write_text(json.dumps(payload, indent=2) + "\n")
 
     def mode_label(self) -> str:
+        if not self.usage_known:
+            return "usage-unknown"
         if self.over_hard_cap():
             return "stopped"
         if self.deepseek_only():

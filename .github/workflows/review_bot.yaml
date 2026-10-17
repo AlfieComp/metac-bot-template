@@ -1,5 +1,8 @@
 name: Review recent forecasts
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:

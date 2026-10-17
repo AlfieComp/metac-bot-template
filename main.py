@@ -12,9 +12,11 @@ import dotenv
 from bot_helpers import (
     FORECAST_GUARDRAIL,
     FORECASTER_ANGLES,
+    GEMINI_MAX_TOKENS,
     OPENROUTER_DEEPSEEK_V4_FLASH,
     OPENROUTER_DEEPSEEK_V4_PRO,
     OPENROUTER_GEMINI_36_FLASH,
+    PERCENTILE_HEIGHTS,
     SPEND_HARD_CAP_USD,
     SPEND_SWITCH_USD,
     SpendCapReached,
@@ -25,9 +27,12 @@ from bot_helpers import (
     estimate_call_cost_usd,
     forecaster_models,
     median_option_probabilities,
+    median_percentile_values,
     print_run_summary_banner,
     print_startup_banner,
+    recorded_call_cost_usd,
     redact_secrets,
+    required_success_fraction,
     resolution_checklist_prompt,
     silence_noisy_dependencies,
     strip_market_and_crowd_odds,
@@ -48,6 +53,7 @@ from forecasting_tools import (
     PredictedOption,
     NumericDistribution,
     NumericQuestion,
+    NumericReport,
     DateQuestion,
     DatePercentile,
     Percentile,
@@ -71,9 +77,13 @@ _FORECASTER_SLOT: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "forecaster_slot", default=None
 )
 
-_GEMINI_MAX_TOKENS = 4096
+_GEMINI_MAX_TOKENS = GEMINI_MAX_TOKENS
 _REASONING_MAX_TOKENS = 6000
 _PARSER_MAX_TOKENS = 2000
+_USAGE_UNKNOWN = (
+    "OpenRouter usage could not be read and there is no saved spend record. "
+    "Refusing to forecast."
+)
 
 
 def _install_median_multiple_choice_aggregation() -> None:
@@ -96,7 +106,28 @@ def _install_median_multiple_choice_aggregation() -> None:
     MultipleChoiceReport.aggregate_predictions = classmethod(aggregate)  # type: ignore[method-assign]
 
 
+def _install_median_numeric_aggregation() -> None:
+    """Median the outcome value at each percentile, including date and conditional questions."""
+
+    async def aggregate(cls, predictions: list[NumericDistribution], question):
+        del cls
+        if not predictions:
+            raise ValueError("No predictions to aggregate")
+        forecasts = []
+        for prediction in predictions:
+            points = prediction.get_percentiles_at_target_heights(list(PERCENTILE_HEIGHTS))
+            forecasts.append([(point.percentile, point.value) for point in points])
+        merged = median_percentile_values(forecasts, PERCENTILE_HEIGHTS)
+        percentiles = [
+            Percentile(percentile=height, value=value) for height, value in merged
+        ]
+        return NumericDistribution.from_question(percentiles, question)
+
+    NumericReport.aggregate_predictions = classmethod(aggregate)  # type: ignore[method-assign]
+
+
 _install_median_multiple_choice_aggregation()
+_install_median_numeric_aggregation()
 
 
 def _looks_like_unsupported_parameter(exc: BaseException) -> bool:
@@ -205,6 +236,10 @@ class FallTemplateBot2026(ForecastBot):
     def __init__(self, *, spend_tracker: SpendTracker | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.spend = spend_tracker or SpendTracker.load()
+        # At least three of the five forecasts must succeed or the question is skipped.
+        self.required_successful_predictions = required_success_fraction(
+            self.expected_total_predictions
+        )
         # The research string already includes the checklist. A second summary
         # call would spend more and is not part of the ensemble.
         self.enable_summarize_research = False
@@ -343,44 +378,49 @@ class FallTemplateBot2026(ForecastBot):
             f"parser:{OPENROUTER_DEEPSEEK_V4_FLASH}", estimate, awaitable
         )
 
+    def _close_awaitable(self, awaitable) -> None:
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+
+    def _raise_spend_block(self, purpose: str, estimate: float) -> None:
+        if not self.spend.usage_known:
+            raise SpendCapReached(_USAGE_UNKNOWN)
+        raise SpendCapReached(
+            f"OpenRouter spend is ${self.spend.effective_usd():.4f}. "
+            f"Another {purpose} call is estimated at ${estimate:.4f}, "
+            f"which would pass the ${SPEND_HARD_CAP_USD:.2f} cap."
+        )
+
     async def _metered_awaitable(self, purpose: str, estimate: float, awaitable):
-        if self.spend.would_exceed_cap(estimate):
-            close = getattr(awaitable, "close", None)
-            if close is not None:
-                close()
-            raise SpendCapReached(
-                f"OpenRouter spend is ${self.spend.effective_usd():.4f}. "
-                f"Another {purpose} call is estimated at ${estimate:.4f}, "
-                f"which would pass the ${SPEND_HARD_CAP_USD:.2f} cap."
-            )
+        # Hold the estimate before the call so parallel forecasts cannot all pass the stop.
+        if not self.spend.try_reserve(estimate):
+            self._close_awaitable(awaitable)
+            self._raise_spend_block(purpose, estimate)
         succeeded = False
-        with MonetaryCostManager() as meter:
-            try:
-                result = await awaitable
-                succeeded = True
-            finally:
-                measured = float(meter.current_usage)
-                if measured > 0:
-                    amount = measured
-                    source = "measured"
-                elif succeeded:
-                    amount = estimate
-                    source = "estimate"
-                else:
-                    amount = 0.0
-                    source = "none"
-                if amount > 0:
-                    self.spend.add_unconfirmed(amount)
-                    self.spend.refresh()
-                    logger.info(
-                        "LLM call purpose=%s cost_usd=%.6f cost_source=%s spend_usd=%.4f mode=%s",
-                        purpose,
-                        amount,
-                        source,
-                        self.spend.effective_usd(),
-                        self.spend.mode_label(),
-                    )
-        return result
+        measured = 0.0
+        try:
+            with MonetaryCostManager() as meter:
+                try:
+                    result = await awaitable
+                    succeeded = True
+                finally:
+                    measured = float(meter.current_usage)
+            return result
+        finally:
+            amount = recorded_call_cost_usd(measured, estimate, succeeded)
+            source = "measured" if succeeded and measured > 0 else "estimate"
+            self.spend.settle_reservation(estimate, amount)
+            self.spend.refresh()
+            logger.info(
+                "LLM call purpose=%s cost_usd=%.6f cost_source=%s spend_usd=%.4f mode=%s succeeded=%s",
+                purpose,
+                amount,
+                source,
+                self.spend.effective_usd(),
+                self.spend.mode_label(),
+                succeeded,
+            )
 
     async def _invoke_forecaster(self, prompt: str) -> str:
         llm = self._current_forecaster()
@@ -397,6 +437,11 @@ class FallTemplateBot2026(ForecastBot):
         if self.question_limit is not None:
             questions = list(questions)[: self.question_limit]
             logger.info("Limiting this run to %s question(s).", self.question_limit)
+        if not self.spend.usage_known:
+            logger.error(_USAGE_UNKNOWN)
+            if return_exceptions:
+                return [SpendCapReached(_USAGE_UNKNOWN)]
+            raise SpendCapReached(_USAGE_UNKNOWN)
         if self.spend.over_hard_cap():
             message = (
                 f"OpenRouter spend is ${self.spend.effective_usd():.4f}, "
@@ -417,6 +462,8 @@ class FallTemplateBot2026(ForecastBot):
         async with self._question_limiter():
             self._next_slot = 0
             self.spend.refresh()
+            if not self.spend.usage_known:
+                raise SpendCapReached(_USAGE_UNKNOWN)
             if self.spend.over_hard_cap():
                 raise SpendCapReached(
                     f"OpenRouter spend is ${self.spend.effective_usd():.4f}, "
@@ -1060,12 +1107,15 @@ if __name__ == "__main__":
 
     spend_tracker = SpendTracker.load()
     spend_tracker.refresh()
-    print(
-        f"OpenRouter spend so far ${spend_tracker.effective_usd():.4f}. "
-        f"Mixed ensemble until ${SPEND_SWITCH_USD:.2f}, "
-        f"hard stop at ${SPEND_HARD_CAP_USD:.2f}. "
-        f"Next question mode: {spend_tracker.mode_label()}.\n"
-    )
+    if not spend_tracker.usage_known:
+        print(_USAGE_UNKNOWN + "\n")
+    else:
+        print(
+            f"OpenRouter spend so far ${spend_tracker.effective_usd():.4f}. "
+            f"Mixed ensemble until ${SPEND_SWITCH_USD:.2f}, "
+            f"hard stop at ${SPEND_HARD_CAP_USD:.2f}. "
+            f"Next question mode: {spend_tracker.mode_label()}.\n"
+        )
 
     # Five forecasts per question, combined by median. Models, the parser,
     # and the resolution checklist are pinned inside FallTemplateBot2026.

@@ -1,5 +1,8 @@
 name: Forecast on new AI tournament questions
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   schedule:
@@ -55,19 +58,16 @@ jobs:
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
-      - name: Keep a spend ledger if the bot did not write one
-        if: always()
-        run: |
-          mkdir -p logs
-          if [ ! -f logs/openrouter_spend.json ]; then
-            printf '%s\n' '{"remote_usd": 0.0, "gap_usd": 0.0}' > logs/openrouter_spend.json
-          fi
       - name: Show spend ledger
         if: always()
         run: |
-          python -c 'import json; d=json.load(open("logs/openrouter_spend.json")); print({k: d[k] for k in ("remote_usd", "gap_usd") if k in d})'
+          if [ -f logs/openrouter_spend.json ]; then
+            python -c 'import json; d=json.load(open("logs/openrouter_spend.json")); print({k: d[k] for k in ("remote_usd", "gap_usd", "usage_known") if k in d})'
+          else
+            echo "No spend ledger. Forecasting is refused when OpenRouter usage is unknown."
+          fi
       - name: Save OpenRouter spend ledger
-        if: always()
+        if: always() && hashFiles('logs/openrouter_spend.json') != ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:

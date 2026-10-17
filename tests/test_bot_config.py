@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,7 +18,9 @@ from bot_helpers import (
     DEEPSEEK_V4_FLASH_ID,
     DEEPSEEK_V4_PRO_ID,
     GEMINI_36_FLASH_ID,
+    GEMINI_MAX_TOKENS,
     KIMI_K3_ID,
+    MIN_SUCCESSFUL_FORECASTS,
     MIXED_FORECASTER_MODELS,
     OPENROUTER_DEEPSEEK_V4_FLASH,
     OPENROUTER_DEEPSEEK_V4_PRO,
@@ -31,11 +34,15 @@ from bot_helpers import (
     call_would_pass_hard_cap,
     clip_and_renormalize,
     clip_probability,
+    estimate_call_cost_usd,
     forecaster_models,
     median_binary,
     median_option_probabilities,
+    median_percentile_values,
     openrouter_model_id,
+    recorded_call_cost_usd,
     redact_secrets,
+    required_success_fraction,
     resolution_checklist_prompt,
     strip_market_and_crowd_odds,
     use_deepseek_only,
@@ -129,13 +136,21 @@ class ResearchGuardTests(unittest.TestCase):
                 "The Metaculus community prediction is 70%.",
                 "Polymarket listed a new contract on the election.",
                 "Kalshi implied probability is 55 percent.",
+                "Polymarket traders price this at 62 percent.",
+                "Forecasters put the odds of Yes near even.",
+                "Market prices have moved this week.",
+                "62 percent of the bill's text was amended.",
             ]
         )
         stripped, removed = strip_market_and_crowd_odds(text)
-        self.assertEqual(removed, 3)
+        self.assertEqual(removed, 6)
         self.assertIn("committee advanced", stripped)
         self.assertIn("listed a new contract", stripped)
+        self.assertIn("bill's text was amended", stripped)
         self.assertNotIn("62%", stripped)
+        self.assertNotIn("62 percent.", stripped)
+        self.assertNotIn("odds of", stripped.lower())
+        self.assertNotIn("market prices", stripped.lower())
         self.assertNotIn("community prediction", stripped.lower())
         self.assertIn("were removed", stripped)
 
@@ -171,6 +186,7 @@ class SpendTrackerTests(unittest.TestCase):
             remote_usd=1.0,
             gap_usd=0.50,
             fetch_usage=lambda: 1.20,
+            usage_known=True,
         )
         partial.refresh()
         self.assertEqual(partial.remote_usd, 1.20)
@@ -182,6 +198,7 @@ class SpendTrackerTests(unittest.TestCase):
             remote_usd=1.0,
             gap_usd=0.50,
             fetch_usage=lambda: 2.0,
+            usage_known=True,
         )
         caught_up.refresh()
         self.assertEqual(caught_up.remote_usd, 2.0)
@@ -194,6 +211,7 @@ class SpendTrackerTests(unittest.TestCase):
             remote_usd=1.0,
             gap_usd=0.04,
             fetch_usage=lambda: 1.0,
+            usage_known=True,
         )
         tracker.refresh()
         self.assertAlmostEqual(tracker.effective_usd(), 1.04)
@@ -202,12 +220,21 @@ class SpendTrackerTests(unittest.TestCase):
         path = Path("/tmp/openrouter_spend_test.json")
         if path.exists():
             path.unlink()
-        tracker = SpendTracker(path=path, remote_usd=1.25, gap_usd=0.0, fetch_usage=lambda: None)
+        tracker = SpendTracker(
+            path=path,
+            remote_usd=1.25,
+            gap_usd=0.0,
+            fetch_usage=lambda: None,
+            usage_known=True,
+        )
         tracker.add_unconfirmed(0.02)
         reloaded = SpendTracker.load(path, fetch_usage=lambda: None)
+        self.assertTrue(reloaded.usage_known)
+        self.assertTrue(reloaded.can_forecast())
         self.assertAlmostEqual(reloaded.effective_usd(), 1.27)
         saved = json.loads(path.read_text())
-        self.assertEqual(set(saved), {"remote_usd", "gap_usd"})
+        self.assertEqual(set(saved), {"remote_usd", "gap_usd", "usage_known"})
+        self.assertTrue(saved["usage_known"])
         path.unlink()
 
     def test_switch_and_cap_follow_effective_spend(self) -> None:
@@ -216,6 +243,7 @@ class SpendTrackerTests(unittest.TestCase):
             remote_usd=3.49,
             gap_usd=0.02,
             fetch_usage=lambda: None,
+            usage_known=True,
         )
         self.assertTrue(tracker.deepseek_only())
         self.assertFalse(tracker.over_hard_cap())
@@ -225,9 +253,163 @@ class SpendTrackerTests(unittest.TestCase):
             remote_usd=4.50,
             gap_usd=0.0,
             fetch_usage=lambda: None,
+            usage_known=True,
         )
         self.assertTrue(capped.over_hard_cap())
         self.assertEqual(capped.mode_label(), "stopped")
+
+    def test_unknown_usage_without_a_ledger_cannot_forecast(self) -> None:
+        path = Path("/tmp/openrouter_spend_missing.json")
+        if path.exists():
+            path.unlink()
+        tracker = SpendTracker.load(path, fetch_usage=lambda: None)
+        tracker.refresh()
+        self.assertFalse(tracker.usage_known)
+        self.assertFalse(tracker.can_forecast())
+        self.assertFalse(tracker.try_reserve(0.01))
+        self.assertFalse(path.exists())
+
+    def test_zero_file_without_the_flag_is_not_a_spend_record(self) -> None:
+        path = Path("/tmp/openrouter_spend_zero.json")
+        path.write_text('{"remote_usd": 0.0, "gap_usd": 0.0}\n')
+        tracker = SpendTracker.load(path, fetch_usage=lambda: None)
+        tracker.refresh()
+        self.assertFalse(tracker.usage_known)
+        self.assertFalse(tracker.can_forecast())
+        path.unlink()
+
+    def test_api_usage_allows_forecast_and_writes_the_flag(self) -> None:
+        path = Path("/tmp/openrouter_spend_api.json")
+        if path.exists():
+            path.unlink()
+        for usage in (0.0, 1.0):
+            tracker = SpendTracker(path=path, fetch_usage=lambda usage=usage: usage)
+            tracker.refresh()
+            self.assertTrue(tracker.usage_known)
+            self.assertTrue(tracker.can_forecast())
+            self.assertAlmostEqual(tracker.remote_usd, usage)
+            saved = json.loads(path.read_text())
+            self.assertTrue(saved["usage_known"])
+            self.assertAlmostEqual(saved["remote_usd"], usage)
+        path.unlink()
+
+    def test_cached_ledger_allows_forecast_when_the_api_fails(self) -> None:
+        path = Path("/tmp/openrouter_spend_cached.json")
+        path.write_text(
+            json.dumps({"remote_usd": 1.5, "gap_usd": 0.1, "usage_known": True}) + "\n"
+        )
+        tracker = SpendTracker.load(path, fetch_usage=lambda: None)
+        tracker.refresh()
+        self.assertTrue(tracker.usage_known)
+        self.assertTrue(tracker.can_forecast())
+        self.assertAlmostEqual(tracker.effective_usd(), 1.6)
+        path.unlink()
+
+    def test_parallel_reserves_cannot_pass_the_cap(self) -> None:
+        tracker = SpendTracker(
+            path=Path("/tmp/does-not-matter.json"),
+            remote_usd=4.30,
+            gap_usd=0.0,
+            fetch_usage=lambda: None,
+            usage_known=True,
+        )
+        results: list[bool] = []
+        lock = threading.Lock()
+
+        def reserve() -> None:
+            allowed = tracker.try_reserve(0.08)
+            with lock:
+                results.append(allowed)
+
+        threads = [threading.Thread(target=reserve) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 2)
+        self.assertAlmostEqual(tracker.reserved_usd, 0.16)
+        self.assertLessEqual(tracker.effective_usd(), SPEND_HARD_CAP_USD)
+
+        sequential = SpendTracker(
+            path=Path("/tmp/does-not-matter.json"),
+            remote_usd=4.40,
+            gap_usd=0.0,
+            fetch_usage=lambda: None,
+            usage_known=True,
+        )
+        self.assertTrue(sequential.try_reserve(0.08))
+        self.assertFalse(sequential.try_reserve(0.08))
+
+    def test_in_flight_reservation_survives_a_usage_refresh(self) -> None:
+        tracker = SpendTracker(
+            path=Path("/tmp/does-not-matter.json"),
+            remote_usd=1.0,
+            gap_usd=0.0,
+            fetch_usage=lambda: 1.10,
+            usage_known=True,
+        )
+        self.assertTrue(tracker.try_reserve(0.05))
+        tracker.refresh()
+        self.assertAlmostEqual(tracker.reserved_usd, 0.05)
+        self.assertAlmostEqual(tracker.remote_usd, 1.10)
+        self.assertAlmostEqual(tracker.effective_usd(), 1.15)
+
+    def test_failed_calls_count_the_estimate(self) -> None:
+        self.assertEqual(recorded_call_cost_usd(0.0, 0.07, False), 0.07)
+        self.assertEqual(recorded_call_cost_usd(0.02, 0.07, False), 0.07)
+        self.assertEqual(recorded_call_cost_usd(0.09, 0.07, True), 0.09)
+        self.assertEqual(recorded_call_cost_usd(0.0, 0.07, True), 0.07)
+
+    def test_gemini_estimate_covers_a_high_reasoning_completion(self) -> None:
+        self.assertGreaterEqual(GEMINI_MAX_TOKENS, 16000)
+        self.assertGreaterEqual(
+            estimate_call_cost_usd(OPENROUTER_GEMINI_36_FLASH, "forecast"), 0.06
+        )
+        self.assertGreaterEqual(
+            estimate_call_cost_usd(OPENROUTER_GEMINI_36_FLASH, "checklist"), 0.06
+        )
+
+
+class NumericAggregationTests(unittest.TestCase):
+    def test_median_is_taken_on_values_at_each_percentile(self) -> None:
+        left = [(0.1, 10.0), (0.5, 50.0), (0.9, 90.0)]
+        right = [(0.1, 30.0), (0.5, 70.0), (0.9, 110.0)]
+        merged = median_percentile_values([left, right], heights=(0.1, 0.5, 0.9))
+        by_height = dict(merged)
+        self.assertAlmostEqual(by_height[0.1], 20.0)
+        self.assertAlmostEqual(by_height[0.5], 60.0)
+        self.assertAlmostEqual(by_height[0.9], 100.0)
+        values = [value for _, value in merged]
+        self.assertEqual(values, sorted(values))
+        self.assertEqual(len(set(values)), len(values))
+
+    def test_tied_percentile_values_are_strictly_increasing(self) -> None:
+        flat = [(0.1, 5.0), (0.9, 5.0)]
+        merged = median_percentile_values([flat, flat])
+        values = [value for _, value in merged]
+        self.assertEqual(values, sorted(set(values)))
+        for earlier, later in zip(values, values[1:]):
+            self.assertLess(earlier, later)
+
+
+class SubmissionThresholdTests(unittest.TestCase):
+    def test_three_of_five_forecasts_are_required(self) -> None:
+        self.assertEqual(MIN_SUCCESSFUL_FORECASTS, 3)
+        fraction = required_success_fraction(5)
+        threshold = 5 * fraction
+        self.assertAlmostEqual(fraction, 0.6)
+        self.assertAlmostEqual(threshold, 3.0)
+        # The parent bot skips the question when successes are below this threshold.
+        self.assertLess(2, threshold)
+        self.assertFalse(3 < threshold)
+
+    def test_bot_wires_the_threshold_reservation_and_numeric_median(self) -> None:
+        source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
+        self.assertIn("required_success_fraction", source)
+        self.assertIn("median_percentile_values", source)
+        self.assertIn("try_reserve", source)
+        self.assertIn("recorded_call_cost_usd", source)
+        self.assertIn("_USAGE_UNKNOWN", source)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -241,6 +423,19 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("--with integrations", text, path.name)
             checked += 1
         self.assertGreaterEqual(checked, 3)
+
+    def test_every_workflow_is_contents_read_and_does_not_invent_zero_spend(self) -> None:
+        workflow_dir = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+        paths = sorted(workflow_dir.glob("*.yaml"))
+        names = {path.name for path in paths}
+        self.assertIn("review_bot.yaml", names)
+        self.assertGreaterEqual(len(paths), 4)
+        for path in paths:
+            text = path.read_text()
+            self.assertIn("permissions:", text, path.name)
+            self.assertIn("contents: read", text, path.name)
+            self.assertNotIn('{"remote_usd": 0.0, "gap_usd": 0.0}', text, path.name)
+            self.assertNotIn("Keep a spend ledger", text, path.name)
 
 
 if __name__ == "__main__":

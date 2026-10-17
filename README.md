@@ -13,7 +13,7 @@ The tournament bot is `main.py`. Each question gets one AskNews briefing (skippe
 
 Reasoning is requested on every forecaster (`reasoning.effort=high`). Probabilities are clipped to 1–99%. Crowd and market odds are removed from the AskNews text. There is no debate step.
 
-Recorded OpenRouter spend switches the five forecasters to DeepSeek V4 Pro once it reaches US$3.50, and the bot stops calling models at US$4.50. Cap the OpenRouter key at US$4.50 in the dashboard as well. A mixed question is about US$0.12; a DeepSeek-only question is about US$0.02. See the pull request for the token assumptions behind those figures.
+Recorded OpenRouter spend switches the five forecasters to DeepSeek V4 Pro once it reaches US$3.50, and the bot stops calling models at US$4.50. If that usage cannot be read and there is no saved spend record, the bot refuses to forecast. A question is submitted only when at least three of the five forecasts succeed. Cap the OpenRouter key at US$4.50 in the dashboard as well. A mixed question is about US$0.12 when answers stay short, and closer to US$0.30 if Gemini uses the full high-reasoning budget. A DeepSeek-only question is about US$0.02. See the pull request for the token assumptions behind those figures.
 
 `poetry install` does not install the optional `integrations` group. The weekly review workflow is the only place that group is installed, and that workflow stays off unless `REVIEW_BOT_ENABLED` is set.
 
