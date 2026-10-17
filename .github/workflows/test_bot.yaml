@@ -5,9 +5,13 @@ on:
   workflow_dispatch:
     inputs:
       live_dry_run:
-        description: "Forecast one bot-testing-area question without submitting (spends OpenRouter credit)"
+        description: "Forecast bot-testing-area questions without submitting (spends OpenRouter credit)"
         type: boolean
         default: false
+      max_questions:
+        description: "How many bot-testing-area questions to forecast without submitting"
+        type: number
+        default: 1
 
 permissions:
   contents: read
@@ -19,14 +23,14 @@ concurrency:
 
 
 # Unit tests do not call Metaculus, OpenRouter, or AskNews.
-# The optional live dry run forecasts one question and does not publish it.
+# The optional live dry run forecasts bot-testing-area questions and does not publish them.
 jobs:
   unit_tests:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+        uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install poetry
@@ -46,8 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+        uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install poetry
@@ -60,16 +64,25 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Restore OpenRouter spend ledger
         continue-on-error: true
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: logs/openrouter_spend.json
           key: openrouter-spend-${{ github.run_id }}
           restore-keys: |
             openrouter-spend-
+      - name: Restore question attempt record
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: logs/question_attempts.json
+          key: question-attempts-${{ github.run_id }}
+          restore-keys: |
+            question-attempts-
       - name: Run bot without submitting
         run: |
-          poetry run python main.py --mode test_questions --dry-run --max-questions 1
+          poetry run python main.py --mode test_questions --dry-run --max-questions "$MAX_QUESTIONS"
         env:
+          MAX_QUESTIONS: ${{ inputs.max_questions || 1 }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
@@ -86,7 +99,22 @@ jobs:
       - name: Save OpenRouter spend ledger
         if: always() && hashFiles('logs/openrouter_spend.json') != ''
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: logs/openrouter_spend.json
           key: openrouter-spend-${{ github.run_id }}
+      - name: Show question attempt record
+        if: always()
+        run: |
+          if [ -f logs/question_attempts.json ]; then
+            python -c 'import json; d=json.load(open("logs/question_attempts.json")); q=d.get("questions") or {}; print({k: len(v) for k, v in q.items()})'
+          else
+            echo "No question attempt record."
+          fi
+      - name: Save question attempt record
+        if: always() && hashFiles('logs/question_attempts.json') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: logs/question_attempts.json
+          key: question-attempts-${{ github.run_id }}

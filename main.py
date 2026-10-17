@@ -19,21 +19,29 @@ from bot_helpers import (
     PERCENTILE_HEIGHTS,
     SPEND_HARD_CAP_USD,
     SPEND_SWITCH_USD,
+    AttemptTracker,
     SpendCapReached,
     SpendTracker,
+    allowed_value_range,
     asknews_configured,
     check_environment,
+    clamp_monotonic_values,
     clip_probability,
     estimate_call_cost_usd,
+    failure_counts_toward_retry,
     forecaster_models,
+    format_forecast_bounds,
     median_option_probabilities,
     median_percentile_values,
+    openrouter_request_body,
     print_run_summary_banner,
     print_startup_banner,
+    question_attempt_key,
     recorded_call_cost_usd,
     redact_secrets,
     required_success_fraction,
     resolution_checklist_prompt,
+    select_questions,
     silence_noisy_dependencies,
     strip_market_and_crowd_odds,
 )
@@ -118,12 +126,35 @@ def _install_median_numeric_aggregation() -> None:
             points = prediction.get_percentiles_at_target_heights(list(PERCENTILE_HEIGHTS))
             forecasts.append([(point.percentile, point.value) for point in points])
         merged = median_percentile_values(forecasts, PERCENTILE_HEIGHTS)
+        lower, upper = _question_bound_numbers(question)
+        values = clamp_monotonic_values(
+            [value for _, value in merged],
+            lower,
+            upper,
+            bool(question.open_lower_bound),
+            bool(question.open_upper_bound),
+        )
         percentiles = [
-            Percentile(percentile=height, value=value) for height, value in merged
+            Percentile(percentile=height, value=value)
+            for (height, _), value in zip(merged, values)
         ]
         return NumericDistribution.from_question(percentiles, question)
 
     NumericReport.aggregate_predictions = classmethod(aggregate)  # type: ignore[method-assign]
+
+
+def _question_bound_numbers(question) -> tuple[float, float]:
+    lower = question.lower_bound
+    upper = question.upper_bound
+    if hasattr(lower, "timestamp"):
+        return float(lower.timestamp()), float(upper.timestamp())
+    return float(lower), float(upper)
+
+
+def _as_utc_text(moment: datetime) -> str:
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 _install_median_multiple_choice_aggregation()
@@ -233,9 +264,16 @@ class FallTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
-    def __init__(self, *, spend_tracker: SpendTracker | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        spend_tracker: SpendTracker | None = None,
+        attempt_tracker: AttemptTracker | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self.spend = spend_tracker or SpendTracker.load()
+        self.attempts = attempt_tracker or AttemptTracker.load()
         # At least three of the five forecasts must succeed or the question is skipped.
         self.required_successful_predictions = required_success_fraction(
             self.expected_total_predictions
@@ -278,6 +316,10 @@ class FallTemplateBot2026(ForecastBot):
             reasoning=False,
         )
         self.set_llm(self._parser, "parser")
+        # The framework still lists a default and a summarizer. Point both at
+        # the project parser so an unused slot cannot call gpt-4o.
+        self.set_llm(self._parser, "default")
+        self.set_llm(self._parser, "summarizer")
         self.set_llm("no_research", "researcher")
 
     @staticmethod
@@ -288,13 +330,9 @@ class FallTemplateBot2026(ForecastBot):
 
     @staticmethod
     def _make_llm(model: str, *, max_tokens: int, reasoning: bool) -> GeneralLlm:
-        # OpenRouter's unified reasoning field. "high" is on for every forecaster.
-        # The parser only formats, so reasoning is off.
-        extra_body = (
-            {"reasoning": {"effort": "high", "enabled": True}}
-            if reasoning
-            else {"reasoning": {"effort": "none", "enabled": False}}
-        )
+        # High reasoning is set on every forecaster, including the DeepSeek-only roster.
+        # The parser only formats, so reasoning is off and no provider filter is sent.
+        extra_body = openrouter_request_body(reasoning=reasoning)
         return GeneralLlm(
             model=model,
             temperature=1 if reasoning else 0,
@@ -413,10 +451,12 @@ class FallTemplateBot2026(ForecastBot):
             self.spend.settle_reservation(estimate, amount)
             self.spend.refresh()
             logger.info(
-                "LLM call purpose=%s cost_usd=%.6f cost_source=%s spend_usd=%.4f mode=%s succeeded=%s",
+                "LLM call purpose=%s cost_usd=%.6f cost_source=%s settled_usd=%.4f reserved_usd=%.4f spend_usd=%.4f mode=%s succeeded=%s",
                 purpose,
                 amount,
                 source,
+                self.spend.settled_usd(),
+                self.spend.reserved_usd,
                 self.spend.effective_usd(),
                 self.spend.mode_label(),
                 succeeded,
@@ -434,9 +474,6 @@ class FallTemplateBot2026(ForecastBot):
         return_exceptions: bool = False,
     ):
         self.spend.refresh()
-        if self.question_limit is not None:
-            questions = list(questions)[: self.question_limit]
-            logger.info("Limiting this run to %s question(s).", self.question_limit)
         if not self.spend.usage_known:
             logger.error(_USAGE_UNKNOWN)
             if return_exceptions:
@@ -452,11 +489,26 @@ class FallTemplateBot2026(ForecastBot):
                 return [SpendCapReached(message)]
             raise SpendCapReached(message)
         logger.info(
-            "OpenRouter spend_usd=%.4f mode=%s",
+            "OpenRouter settled_usd=%.4f reserved_usd=%.4f spend_usd=%.4f mode=%s",
+            self.spend.settled_usd(),
+            self.spend.reserved_usd,
             self.spend.effective_usd(),
             self.spend.mode_label(),
         )
-        return await super().forecast_questions(questions, return_exceptions)
+        incoming = list(questions)
+        chosen = select_questions(
+            incoming,
+            skip_already_forecasted=self.skip_previously_forecasted_questions,
+            skipped_attempt_ids=self.attempts.skipped_ids(),
+            limit=self.question_limit,
+        )
+        logger.info(
+            "Forecasting %s question(s) after dropping already-forecasted and recently failed questions (limit=%s, candidates=%s).",
+            len(chosen),
+            self.question_limit,
+            len(incoming),
+        )
+        return await super().forecast_questions(chosen, return_exceptions)
 
     async def _run_individual_question(self, question: MetaculusQuestion):
         async with self._question_limiter():
@@ -470,15 +522,38 @@ class FallTemplateBot2026(ForecastBot):
                     "which is at the US$4.50 cap."
                 )
             logger.info(
-                "Question %s spend_usd=%.4f mode=%s",
+                "Question %s settled_usd=%.4f reserved_usd=%.4f spend_usd=%.4f mode=%s",
                 question.page_url,
+                self.spend.settled_usd(),
+                self.spend.reserved_usd,
                 self.spend.effective_usd(),
                 self.spend.mode_label(),
             )
             try:
                 return await super()._run_individual_question(question)
+            except Exception as exc:
+                if failure_counts_toward_retry(exc):
+                    self._record_question_failure(question)
+                raise
             finally:
                 self.spend.refresh()
+
+    def _record_question_failure(self, question: MetaculusQuestion) -> None:
+        try:
+            key = question_attempt_key(question)
+        except ValueError:
+            logger.warning("Could not record a failed attempt for %s", question.page_url)
+            return
+        try:
+            self.attempts.record_failure(key)
+        except Exception:
+            logger.warning("Could not save the attempt record for question %s", key)
+            return
+        logger.info(
+            "Recorded a failed attempt for question %s (%s in the last 24h).",
+            key,
+            self.attempts.recent_failures(key),
+        )
 
     async def _make_prediction(
         self, question: MetaculusQuestion, research: str
@@ -634,9 +709,7 @@ class FallTemplateBot2026(ForecastBot):
         ))
         decimal_pred = clip_probability(binary_prediction.prediction_in_decimal)
 
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
-        )
+        self._log_forecast(question, decimal_pred)
         return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
 
     ##################################### MULTIPLE CHOICE QUESTIONS #####################################
@@ -711,9 +784,7 @@ class FallTemplateBot2026(ForecastBot):
             additional_instructions=parsing_instructions,
         ))
 
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
-        )
+        self._log_forecast(question, predicted_option_list)
         return ReasonedPrediction(
             prediction_value=predicted_option_list, reasoning=reasoning
         )
@@ -751,6 +822,7 @@ class FallTemplateBot2026(ForecastBot):
 
             {lower_bound_message}
             {upper_bound_message}
+            {self._bounds_prompt(question)}
 
             Formatting Instructions:
             - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
@@ -810,10 +882,15 @@ class FallTemplateBot2026(ForecastBot):
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
         ))
-        prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
+        clamped = self._clamp_percentile_values(
+            question, [percentile.value for percentile in percentile_list]
         )
+        percentile_list = [
+            Percentile(percentile=percentile.percentile, value=value)
+            for percentile, value in zip(percentile_list, clamped)
+        ]
+        prediction = NumericDistribution.from_question(percentile_list, question)
+        self._log_forecast(question, prediction.declared_percentiles)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
     ##################################### DATE QUESTIONS #####################################
@@ -847,6 +924,7 @@ class FallTemplateBot2026(ForecastBot):
 
             {lower_bound_message}
             {upper_bound_message}
+            {self._bounds_prompt(question)}
 
             Formatting Instructions:
             - This is a date question, and as such, the answer must be expressed in terms of dates.
@@ -905,17 +983,16 @@ class FallTemplateBot2026(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
         ))
 
+        raw_timestamps = [
+            percentile.value.timestamp() for percentile in date_percentile_list
+        ]
+        clamped = self._clamp_percentile_values(question, raw_timestamps)
         percentile_list = [
-            Percentile(
-                percentile=percentile.percentile,
-                value=percentile.value.timestamp(),
-            )
-            for percentile in date_percentile_list
+            Percentile(percentile=percentile.percentile, value=value)
+            for percentile, value in zip(date_percentile_list, clamped)
         ]
         prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
-        )
+        self._log_forecast(question, prediction.declared_percentiles)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
     def _create_resolved_question_parsing_message(self) -> str:
@@ -966,6 +1043,61 @@ class FallTemplateBot2026(ForecastBot):
         else:
             lower_bound_message = f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
         return upper_bound_message, lower_bound_message
+
+    def _bounds_prompt(self, question: NumericQuestion | DateQuestion) -> str:
+        """State the allowed range. The same prompt is used for every roster, including DeepSeek-only."""
+        lower, upper = _question_bound_numbers(question)
+        allowed_low, allowed_high = allowed_value_range(
+            lower,
+            upper,
+            bool(question.open_lower_bound),
+            bool(question.open_upper_bound),
+        )
+        if isinstance(question, DateQuestion):
+            return format_forecast_bounds(
+                lower=_as_utc_text(question.lower_bound),
+                upper=_as_utc_text(question.upper_bound),
+                allowed_low=_as_utc_text(datetime.fromtimestamp(allowed_low, tz=timezone.utc)),
+                allowed_high=_as_utc_text(datetime.fromtimestamp(allowed_high, tz=timezone.utc)),
+                open_lower=bool(question.open_lower_bound),
+                open_upper=bool(question.open_upper_bound),
+            )
+        unit = f" {question.unit_of_measure}" if question.unit_of_measure else ""
+        return format_forecast_bounds(
+            lower=f"{question.lower_bound}{unit}",
+            upper=f"{question.upper_bound}{unit}",
+            allowed_low=f"{allowed_low}{unit}",
+            allowed_high=f"{allowed_high}{unit}",
+            open_lower=bool(question.open_lower_bound),
+            open_upper=bool(question.open_upper_bound),
+        )
+
+    def _clamp_percentile_values(
+        self, question: NumericQuestion | DateQuestion, values: list[float]
+    ) -> list[float]:
+        lower, upper = _question_bound_numbers(question)
+        clamped = clamp_monotonic_values(
+            values,
+            lower,
+            upper,
+            bool(question.open_lower_bound),
+            bool(question.open_upper_bound),
+        )
+        if any(abs(old - new) > 1e-9 for old, new in zip(values, clamped)):
+            logger.info(
+                "Clamped percentiles for %s with model %s into the allowed range.",
+                question.page_url,
+                self._current_forecaster().model,
+            )
+        return clamped
+
+    def _log_forecast(self, question: MetaculusQuestion, prediction: object) -> None:
+        logger.info(
+            "Forecasted URL %s with model %s and prediction: %s.",
+            question.page_url,
+            self._current_forecaster().model,
+            prediction,
+        )
 
     ##################################### CONDITIONAL QUESTIONS #####################################
 
@@ -1107,6 +1239,12 @@ if __name__ == "__main__":
 
     spend_tracker = SpendTracker.load()
     spend_tracker.refresh()
+    attempt_tracker = AttemptTracker.load()
+    skipped_for_failures = attempt_tracker.skipped_ids()
+    if skipped_for_failures:
+        print(
+            f"Skipping {len(skipped_for_failures)} question(s) that failed twice in the last 24 hours.\n"
+        )
     if not spend_tracker.usage_known:
         print(_USAGE_UNKNOWN + "\n")
     else:
@@ -1129,6 +1267,7 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         spend_tracker=spend_tracker,
+        attempt_tracker=attempt_tracker,
     )
     template_bot.question_limit = args.max_questions
 

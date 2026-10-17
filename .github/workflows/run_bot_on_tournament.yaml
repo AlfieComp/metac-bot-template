@@ -32,8 +32,8 @@ jobs:
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
-        uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+        uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install poetry
@@ -45,7 +45,7 @@ jobs:
       # Adding the below will make the workflow faster, but will mean you don't automatically get updates from forecasting-tools and other packages
       # - name: Load cached venv
       #   id: cached-poetry-dependencies
-      #   uses: actions/cache@v4
+      #   uses: actions/cache@v6
       #   with:
       #     path: .venv
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
@@ -53,15 +53,26 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Restore OpenRouter spend ledger
         continue-on-error: true
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: logs/openrouter_spend.json
           key: openrouter-spend-${{ github.run_id }}
           restore-keys: |
             openrouter-spend-
+      - name: Restore question attempt record
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: logs/question_attempts.json
+          key: question-attempts-${{ github.run_id }}
+          restore-keys: |
+            question-attempts-
       - name: Run bot
         # A manual run defaults to a dry run of 3 questions. A schedule, once
-        # the cron above is restored, leaves both values empty and submits with no cap.
+        # the cron above is restored, submits and stops after 5 questions
+        # (or the MAX_QUESTIONS repository variable). The limit is applied
+        # after questions that were already forecast, or that failed twice
+        # in the last 24 hours, have been skipped.
         run: |
           args=()
           if [ "$DRY_RUN" = "true" ]; then
@@ -74,7 +85,7 @@ jobs:
         # Secrets stay in the environment. Do not print them.
         env:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
-          MAX_QUESTIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_questions || '' }}
+          MAX_QUESTIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_questions || vars.MAX_QUESTIONS || '5' }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
@@ -91,7 +102,22 @@ jobs:
       - name: Save OpenRouter spend ledger
         if: always() && hashFiles('logs/openrouter_spend.json') != ''
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: logs/openrouter_spend.json
           key: openrouter-spend-${{ github.run_id }}
+      - name: Show question attempt record
+        if: always()
+        run: |
+          if [ -f logs/question_attempts.json ]; then
+            python -c 'import json; d=json.load(open("logs/question_attempts.json")); q=d.get("questions") or {}; print({k: len(v) for k, v in q.items()})'
+          else
+            echo "No question attempt record."
+          fi
+      - name: Save question attempt record
+        if: always() && hashFiles('logs/question_attempts.json') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: logs/question_attempts.json
+          key: question-attempts-${{ github.run_id }}

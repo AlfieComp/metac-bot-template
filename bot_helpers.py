@@ -17,6 +17,7 @@ import statistics
 import sys
 import threading
 import warnings
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -636,8 +637,12 @@ class SpendTracker:
             usage_known=usage_known,
         )
 
+    def settled_usd(self) -> float:
+        """Spend that has been recorded, excluding in-flight reservations."""
+        return self.remote_usd + self.gap_usd
+
     def effective_usd(self) -> float:
-        return self.remote_usd + self.gap_usd + self.reserved_usd
+        return self.settled_usd() + self.reserved_usd
 
     def can_forecast(self) -> bool:
         """True when spend is known. The hard cap is checked separately."""
@@ -730,3 +735,279 @@ class SpendTracker:
         if self.deepseek_only():
             return "deepseek-only"
         return "mixed"
+
+
+# Skip a question after this many failed attempts inside the window.
+# A skip is not itself a failure, and a spend stop is not a failed attempt.
+MAX_FAILED_ATTEMPTS = 2
+ATTEMPT_WINDOW = timedelta(hours=24)
+DEFAULT_ATTEMPT_LEDGER = Path("logs/question_attempts.json")
+
+# Open bounds may sit slightly outside the stated bound. Closed bounds may not.
+OPEN_BOUND_MARGIN = 0.05
+# Reasoning calls avoid the fp8/fp4 hosts seen on the dry run. "unknown" stays
+# allowed because several full-precision hosts do not publish a quantization.
+_REASONING_QUANTIZATIONS = ("fp16", "bf16", "fp32", "unknown")
+
+
+def openrouter_request_body(*, reasoning: bool) -> dict[str, Any]:
+    """Body sent to OpenRouter. Reasoning calls ask for high effort explicitly."""
+    if not reasoning:
+        return {"reasoning": {"effort": "none", "enabled": False}}
+    return {
+        "reasoning": {"effort": "high", "enabled": True},
+        "provider": {"quantizations": list(_REASONING_QUANTIZATIONS)},
+    }
+
+
+def question_attempt_key(question: Any) -> str:
+    """Stable id for the attempt ledger. Prefers the Metaculus question id."""
+    identifier = getattr(question, "id_of_question", None)
+    if identifier is not None:
+        return str(identifier)
+    page = getattr(question, "page_url", None)
+    if page:
+        return str(page)
+    raise ValueError("Question has no id to record")
+
+
+def failure_counts_toward_retry(exc: BaseException) -> bool:
+    """A spend stop halts the run. It is not a failed attempt at one question."""
+    if isinstance(exc, SpendCapReached):
+        return False
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        return any(failure_counts_toward_retry(item) for item in nested)
+    return True
+
+
+class AttemptTracker:
+    """
+    Remember questions that failed so the next run can skip them.
+
+    The file matches the spend ledger: one JSON document under logs/, restored
+    and saved by the GitHub Actions cache. Only question ids and timestamps
+    are stored.
+    """
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        questions: dict[str, list[datetime]] | None = None,
+    ) -> None:
+        self.path = path or DEFAULT_ATTEMPT_LEDGER
+        self._questions: dict[str, list[datetime]] = {
+            str(key): list(stamps) for key, stamps in (questions or {}).items()
+        }
+        self._lock = threading.Lock()
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "AttemptTracker":
+        ledger_path = path or DEFAULT_ATTEMPT_LEDGER
+        questions: dict[str, list[datetime]] = {}
+        if ledger_path.is_file():
+            try:
+                raw = json.loads(ledger_path.read_text())
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raw = None
+            stored = raw.get("questions") if isinstance(raw, dict) else None
+            if isinstance(stored, dict):
+                for key, stamps in stored.items():
+                    parsed: list[datetime] = []
+                    if not isinstance(stamps, list):
+                        continue
+                    for stamp in stamps:
+                        if not isinstance(stamp, str):
+                            continue
+                        try:
+                            moment = datetime.fromisoformat(stamp)
+                        except ValueError:
+                            continue
+                        if moment.tzinfo is None:
+                            moment = moment.replace(tzinfo=timezone.utc)
+                        parsed.append(moment.astimezone(timezone.utc))
+                    if parsed:
+                        questions[str(key)] = parsed
+        return cls(path=ledger_path, questions=questions)
+
+    def recent_failures(self, question_id: str, *, now: datetime | None = None) -> int:
+        moment = _as_utc(now)
+        cutoff = moment - ATTEMPT_WINDOW
+        with self._lock:
+            stamps = self._questions.get(str(question_id), [])
+            return sum(1 for stamp in stamps if stamp >= cutoff)
+
+    def should_skip(self, question_id: str, *, now: datetime | None = None) -> bool:
+        return self.recent_failures(question_id, now=now) >= MAX_FAILED_ATTEMPTS
+
+    def skipped_ids(self, *, now: datetime | None = None) -> set[str]:
+        moment = _as_utc(now)
+        with self._lock:
+            self._prune_locked(moment)
+            return {
+                key
+                for key, stamps in self._questions.items()
+                if len(stamps) >= MAX_FAILED_ATTEMPTS
+            }
+
+    def record_failure(self, question_id: str, *, now: datetime | None = None) -> None:
+        """Append one failure. A question already at the skip threshold is left unchanged."""
+        moment = _as_utc(now)
+        key = str(question_id)
+        with self._lock:
+            self._prune_locked(moment)
+            stamps = self._questions.get(key, [])
+            if len(stamps) >= MAX_FAILED_ATTEMPTS:
+                return
+            stamps.append(moment)
+            self._questions[key] = stamps
+            self._save_locked()
+
+    def _prune_locked(self, now: datetime) -> None:
+        cutoff = now - ATTEMPT_WINDOW
+        empty: list[str] = []
+        for key, stamps in self._questions.items():
+            kept = [stamp for stamp in stamps if stamp >= cutoff]
+            if kept:
+                self._questions[key] = kept
+            else:
+                empty.append(key)
+        for key in empty:
+            del self._questions[key]
+
+    def _save_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "questions": {
+                key: [stamp.astimezone(timezone.utc).isoformat() for stamp in stamps]
+                for key, stamps in sorted(self._questions.items())
+            }
+        }
+        self.path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def select_questions(
+    questions: Sequence[Any],
+    *,
+    skip_already_forecasted: bool,
+    skipped_attempt_ids: set[str],
+    limit: int | None,
+) -> list[Any]:
+    """Drop finished and recently failed questions, then apply the per-run cap."""
+    chosen: list[Any] = []
+    for question in questions:
+        if skip_already_forecasted and getattr(question, "already_forecasted", False):
+            continue
+        if question_attempt_key(question) in skipped_attempt_ids:
+            continue
+        chosen.append(question)
+    if limit is None:
+        return chosen
+    if limit < 1:
+        raise ValueError("Question limit must be at least 1")
+    return chosen[:limit]
+
+
+def allowed_value_range(
+    lower: float,
+    upper: float,
+    open_lower: bool,
+    open_upper: bool,
+    margin_fraction: float = OPEN_BOUND_MARGIN,
+) -> tuple[float, float]:
+    """Inclusive interval a percentile is allowed to occupy."""
+    low_bound = float(lower)
+    high_bound = float(upper)
+    if (
+        not math.isfinite(low_bound)
+        or not math.isfinite(high_bound)
+        or high_bound <= low_bound
+    ):
+        raise ValueError(
+            "Question bounds must be finite and the upper bound must be greater than the lower bound"
+        )
+    span = high_bound - low_bound
+    margin = span * margin_fraction
+    low = low_bound - margin if open_lower else low_bound
+    high = high_bound + margin if open_upper else high_bound
+    return low, high
+
+
+def clamp_monotonic_values(
+    values: Sequence[float],
+    lower: float,
+    upper: float,
+    open_lower: bool,
+    open_upper: bool,
+    margin_fraction: float = OPEN_BOUND_MARGIN,
+) -> list[float]:
+    """Pull percentile values into the allowed range and keep them strictly increasing."""
+    if not values:
+        raise ValueError("No percentile values to clamp")
+    low, high = allowed_value_range(
+        lower, upper, open_lower, open_upper, margin_fraction
+    )
+    clamped: list[float] = []
+    for value in values:
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError("Percentile value is not a finite number")
+        clamped.append(min(high, max(low, numeric)))
+    return _strictly_increasing_inside(clamped, low, high)
+
+
+def _strictly_increasing_inside(
+    values: list[float], low: float, high: float
+) -> list[float]:
+    count = len(values)
+    if count == 1:
+        return [min(high, max(low, values[0]))]
+    span = high - low
+    if span <= 0:
+        raise ValueError("Allowed range has no width")
+    min_step = max(span / (count - 1) / 1_000_000, span * 1e-12)
+    result = list(values)
+    for index in range(1, count):
+        if result[index] <= result[index - 1]:
+            result[index] = result[index - 1] + min_step
+    if result[-1] > high or result[0] < low:
+        result[-1] = min(result[-1], high)
+        for index in range(count - 2, -1, -1):
+            if result[index] >= result[index + 1]:
+                result[index] = result[index + 1] - min_step
+    if (
+        result[0] < low
+        or result[-1] > high
+        or any(result[index] <= result[index - 1] for index in range(1, count))
+    ):
+        step = span / (count - 1)
+        result = [low + step * index for index in range(count)]
+    return result
+
+
+def format_forecast_bounds(
+    *,
+    lower: str,
+    upper: str,
+    allowed_low: str,
+    allowed_high: str,
+    open_lower: bool,
+    open_upper: bool,
+) -> str:
+    """Sentence the numeric and date prompts use to state the allowed range."""
+    lower_kind = "open" if open_lower else "closed"
+    upper_kind = "open" if open_upper else "closed"
+    return (
+        f"Allowed range: every percentile value must be between {allowed_low} and {allowed_high}, inclusive. "
+        f"The question lower bound is {lower} and it is {lower_kind}. "
+        f"The question upper bound is {upper} and it is {upper_kind}. "
+        "A closed bound is a hard limit. An open bound allows only the small margin already included in the allowed range. "
+        "Do not write any percentile outside that allowed range. Keep the values strictly increasing."
+    )
+
+
+def _as_utc(moment: datetime | None) -> datetime:
+    current = moment or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc)
